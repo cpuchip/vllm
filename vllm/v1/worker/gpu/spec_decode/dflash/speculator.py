@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import copy
 from types import SimpleNamespace
+import os
+from collections.abc import Mapping
 from typing import Any
 
 import numpy as np
@@ -63,8 +65,36 @@ class DFlashSpeculator(DraftModelSpeculator):
         # Multimodal inputs not currently supported.
         self.supports_mm_inputs = False
 
+        # The drafter emits the block it was trained for (dflash_config.block_size - 1);
+        # the *verify* block may be longer than that, with the extra positions filled from
+        # the request's own context (dflash2/lookup.py). Everything describing the draft
+        # model's own query layout uses draft_block, everything describing the proposal
+        # handed to the target uses num_speculative_steps.
+        trained_block = (
+            int(
+                (getattr(self.draft_model_config.hf_config, "dflash_config", None) or {}).get(
+                    "block_size", 0
+                )
+            )
+            - 1
+        )
+        self.draft_block = self.num_speculative_steps
+        # Only the lookup can fill the extra positions, so without it the drafter keeps
+        # being asked for the whole (longer) block, which is also the honest A/B control.
+        lookup_on = os.environ.get("VLLM_DFLASH2_LOOKUP", "0") == "1"
+        if lookup_on and 0 < trained_block < self.num_speculative_steps:
+            self.draft_block = trained_block
+            logger.info(
+                "%s: drafting %d tokens per step (the block the checkpoint was trained "
+                "for); the remaining %d of %d verify positions are filled from context.",
+                self._speculator_name,
+                self.draft_block,
+                self.num_speculative_steps - self.draft_block,
+                self.num_speculative_steps,
+            )
+
         # Each request emits exactly (bonus + N mask) query tokens per step.
-        self.num_query_per_req = 1 + self.num_speculative_steps
+        self.num_query_per_req = 1 + self.draft_block
 
         self.parallel_drafting_token_id = get_parallel_drafting_token_id(
             self.draft_model_config.hf_config
@@ -98,7 +128,7 @@ class DFlashSpeculator(DraftModelSpeculator):
         )
 
         # Per-mask-token sampling buffers. Flattened from (num_reqs, num_spec_tokens).
-        max_num_sampled_tokens = self.max_num_reqs * self.num_speculative_steps
+        max_num_sampled_tokens = self.max_num_reqs * self.draft_block
         self.sample_indices = torch.zeros(
             max_num_sampled_tokens, dtype=torch.int64, device=device
         )
@@ -114,7 +144,7 @@ class DFlashSpeculator(DraftModelSpeculator):
         # [0, 1, ..., N-1, 0, 1, ..., N-1, ...] -> the per-token column index into
         # draft_logits[req, step, :].
         self.sample_col = torch.arange(
-            self.num_speculative_steps, dtype=torch.int32, device=device
+            self.draft_block, dtype=torch.int32, device=device
         ).repeat(self.max_num_reqs)
 
         self.query_cudagraph_manager: DFlashCudaGraphManager | None = None
@@ -292,7 +322,7 @@ class DFlashSpeculator(DraftModelSpeculator):
             num_tokens_across_dp,
             cudagraph_runtime_mode,
         )
-        num_sample = num_reqs * self.num_speculative_steps
+        num_sample = num_reqs * self.draft_block
         sample_hidden_states = last_hidden_states[self.sample_indices[:num_sample]]
         # sample_pos is the predicted token's position P. Sampling keys a draw
         # by the position before the sampled token, P-1.
@@ -305,8 +335,8 @@ class DFlashSpeculator(DraftModelSpeculator):
             self.sample_col[:num_sample],
             self.draft_logits,
         )
-        self.draft_tokens[:num_reqs] = draft_tokens.view(
-            num_reqs, self.num_speculative_steps
+        self.draft_tokens[:num_reqs, : self.draft_block] = draft_tokens.view(
+            num_reqs, self.draft_block
         )
 
     @torch.inference_mode()
@@ -338,6 +368,11 @@ class DFlashSpeculator(DraftModelSpeculator):
         is_profile: bool = False,
     ) -> torch.Tensor:
         num_reqs = input_batch.num_reqs
+        # What the step that just ran actually produced per request: num_sampled counts the
+        # sampling slots it was given (bonus + drafts), num_rejected how many of those were
+        # thrown away, so the difference is the tokens it emitted. dflash2/lookup.py decides
+        # the next block length from it.
+        self.last_num_emitted = (num_sampled - num_rejected) if num_sampled is not None else None
         num_target_tokens = input_batch.num_tokens
         num_query_tokens = num_reqs * self.num_query_per_req
         max_seq_len = input_batch.seq_lens_cpu_upper_bound[:num_reqs].max().item()
@@ -412,7 +447,7 @@ class DFlashSpeculator(DraftModelSpeculator):
                 self.block_tables.cp_interleave,
                 self.parallel_drafting_token_id,
                 self.num_query_per_req,
-                self.num_speculative_steps,
+                self.draft_block,
                 self.max_num_reqs,
                 self.max_num_tokens,
                 self.max_model_len,
