@@ -110,8 +110,25 @@ def _largest_kernel_block_within(
 
     sizes = attn_backend.get_supported_kernel_block_sizes()
     candidates = [s for s in sizes if isinstance(s, int)]
+    mults = [s.base for s in sizes if isinstance(s, MultipleOf)]
+    if mults and page_budget and per_token_bytes > 0:
+        base = min(mults)
+        budget_tokens = page_budget // per_token_bytes
+        scaled = budget_tokens // base * base
+        if fallback and fallback > 0:
+            for step in (128, base):
+                found = 0
+                for d in range(budget_tokens, step - 1, -1):
+                    if fallback % d == 0 and d % step == 0:
+                        found = d
+                        break
+                if found:
+                    scaled = found
+                    break
+        if scaled >= base:
+            candidates.append(scaled)
     if not candidates:
-        candidates = [s.base for s in sizes if isinstance(s, MultipleOf)]
+        candidates = mults
     if not candidates:
         return fallback
     smallest = min(candidates)
@@ -619,6 +636,13 @@ class Attention(nn.Module, AttentionLayerBase):
             # bytes per block. Otherwise (page_size_padded is None) the smallest
             # block is fine — ``unify`` scales it up by an integer ratio.
             shared_page = vllm_config.cache_config.skip_page_size_padded
+            # port(kvarn-v2): hybrid without skip layers: pad the drafter's
+            # SW pages to the mamba/primary page instead of wasting 16-token
+            # blocks inside 1.8 MB uniform pages (26x overhead).
+            if shared_page is None and str(
+                vllm_config.cache_config.cache_dtype
+            ).startswith("kvarn"):
+                shared_page = vllm_config.cache_config.mamba_page_size_padded
             # The backend owns its packing
             sw_per_token = self.attn_backend.customize_spec(
                 SlidingWindowSpec(
