@@ -1,7 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import os
 from abc import ABC, abstractmethod
+
+# Opt-in for issue #52: hold each running request's reachable mamba "align"
+# state snapshots (the CoW-carried key it resumed from and the last written
+# prompt-region boundaries, <= 3 blocks per request per group) until the
+# request finishes, and free them last. Costs a few held blocks per running
+# request; no effect on hit semantics or model output.
+_KEEP_ALIGN_CHECKPOINTS = (
+    os.environ.get("VLLM_MAMBA_ALIGN_KEEP_CHECKPOINTS") == "1"
+)
+
 from collections import defaultdict
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, ClassVar
@@ -1482,6 +1493,13 @@ class MambaManager(SingleTypeKVCacheManager):
             # connector; a request that finishes first hands off this table
             # source directly.
             self._producer_partial_tail_reqs: dict[str, tuple[KVCacheBlock, int]] = {}
+            # Cached state blocks at the last prompt-region boundaries, held
+            # until request end instead of being freed mid-decode. They are the
+            # only mamba blocks a follow-up strict-extension request can hit,
+            # and freeing them mid-decode puts them at the front of the
+            # eviction line while the attention blocks they unlock sit safely
+            # at the back (issue #52 / upstream #45238).
+            self._deferred_state_blocks: dict[str, list[KVCacheBlock]] = {}
 
     @classmethod
     def find_longest_cache_hit(
@@ -1669,8 +1687,37 @@ class MambaManager(SingleTypeKVCacheManager):
                 < cdiv(processed_computed_tokens, self.block_size) - 1
             ):
                 blocks = self.req_to_blocks[request_id]
-                if blocks[last_state_block_idx] != self._null_block:
-                    self.block_pool.free_blocks([blocks[last_state_block_idx]])
+                blk = blocks[last_state_block_idx]
+                if blk != self._null_block:
+                    boundary_tok = (last_state_block_idx + 1) * self.block_size
+                    # Keep the cached state snapshots at the last prompt-region
+                    # boundaries alive until the request finishes: they are the
+                    # only snapshots a follow-up turn's prefix hit can resume
+                    # from, and the finish-time free puts them at the freshest
+                    # end of the eviction queue (behind the whole conversation's
+                    # attention blocks instead of ahead of them). Align mode
+                    # only materializes state at prefill chunk-step boundaries
+                    # (~chunk_size apart, aligned down to the mamba block), so
+                    # the servable snapshot can sit up to chunk_size below the
+                    # prompt end; keep the LAST TWO at/below it (states past
+                    # the prompt end can never serve: with a reasoning model
+                    # the re-rendered history diverges right at the prompt end
+                    # because think blocks are stripped). Bounded: <= 2 blocks
+                    # held per request per group.
+                    if (
+                        _KEEP_ALIGN_CHECKPOINTS
+                        and blk.block_hash is not None
+                        and num_prompt_tokens is not None
+                        and boundary_tok <= num_prompt_tokens
+                    ):
+                        deferred = self._deferred_state_blocks.setdefault(
+                            request_id, []
+                        )
+                        deferred.append(blk)
+                        if len(deferred) > 3:
+                            self.block_pool.free_blocks([deferred.pop(0)])
+                    else:
+                        self.block_pool.free_blocks([blk])
                     blocks[last_state_block_idx] = self._null_block
 
     def get_num_common_prefix_blocks(self, running_request_id: str) -> int:
@@ -1923,9 +1970,41 @@ class MambaManager(SingleTypeKVCacheManager):
                             # The moved entry is only filled by this step's
                             # copy, so defer same-step hits on it.
                             self.cached_blocks_this_step.add(cow_block.block_hash)
+                        if (
+                            _KEEP_ALIGN_CHECKPOINTS
+                            and cow_block.block_hash is not None
+                        ):
+                            # This block now carries the chain's reachable
+                            # boundary state — the one snapshot the NEXT turn's
+                            # hit resumes from. Releasing it right after the
+                            # copy plants it at the front of the eviction line
+                            # every turn (issue #52); hold it until request end
+                            # and free it last instead.
+                            cow_block.ref_cnt += 1
+                            deferred = self._deferred_state_blocks.setdefault(
+                                request_id, []
+                            )
+                            deferred.append(cow_block)
+                            if len(deferred) > 3:
+                                self.block_pool.free_blocks([deferred.pop(0)])
                     else:
                         self._apply_cow(request_id, block_idx, source_block, cow_block)
                         returned_blocks = [cow_block] + returned_blocks
+                        if (
+                            _KEEP_ALIGN_CHECKPOINTS
+                            and source_block.block_hash is not None
+                        ):
+                            # Same reasoning as the running-request CoW above:
+                            # source_block stays the cached copy of the chain's
+                            # reachable boundary state; keep it alive until
+                            # request end so it is freed last.
+                            source_block.ref_cnt += 1
+                            deferred = self._deferred_state_blocks.setdefault(
+                                request_id, []
+                            )
+                            deferred.append(source_block)
+                            if len(deferred) > 3:
+                                self.block_pool.free_blocks([deferred.pop(0)])
                 req_blocks.extend(new_blocks)
                 self._allocated_block_reqs.add(request_id)
                 self._partial_hit_reqs.pop(request_id, None)
@@ -1976,6 +2055,13 @@ class MambaManager(SingleTypeKVCacheManager):
                 for entry in self._pending_boundary_state_offloads
                 if entry[0] != request_id
             ]
+            deferred = self._deferred_state_blocks.pop(request_id, None)
+            if deferred:
+                # The caller frees the returned list in reverse order (tail
+                # blocks are evicted first), so putting the prompt-boundary
+                # state snapshots at the FRONT makes them the last blocks
+                # freed — the freshest eviction position in the pool.
+                return deferred + super().pop_blocks_for_free(request_id)
         return super().pop_blocks_for_free(request_id)
 
     def get_num_skipped_tokens(self, num_computed_tokens: int) -> int:
