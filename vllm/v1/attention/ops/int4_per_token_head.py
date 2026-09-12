@@ -386,6 +386,9 @@ def _attn_packed(
     PACKING_FACTOR: tl.constexpr,
     FP8_MIN: tl.constexpr = float8_info.min,
     FP8_MAX: tl.constexpr = float8_info.max,
+    USE_CAUSAL: tl.constexpr = True,
+    USE_PER_SEQ_CAUSAL: tl.constexpr = False,
+    per_seq_causal_ptr=None,
 ):
     # Shared prologue: sequence lookup, q-block bounds, early returns.
     q_block_global_idx = tl.program_id(0)
@@ -563,6 +566,9 @@ def _attn_packed(
             SLIDING_WINDOW,
             USE_MM_PREFIX,
             MAX_MM_RANGES,
+            USE_CAUSAL,
+            USE_PER_SEQ_CAUSAL,
+            per_seq_causal_ptr,
         )
 
         # Score: split-dot across the 2 INT4 streams; fused
@@ -693,6 +699,8 @@ def _launch_packed_attn(
     softmax_segm_max,
     softmax_segm_expsum,
     packing_factor: int,
+    use_causal: bool = True,
+    per_seq_causal_ptr: torch.Tensor | None = None,
 ):
     """Launch ``_attn_packed`` for one of the sub-byte modes.
 
@@ -823,6 +831,9 @@ def _launch_packed_attn(
         USE_FP8=output_scale is not None,
         IS_3D=use_3d,
         PACKING_FACTOR=packing_factor,
+        USE_CAUSAL=use_causal,
+        USE_PER_SEQ_CAUSAL=(per_seq_causal_ptr is not None),
+        per_seq_causal_ptr=per_seq_causal_ptr,
     )
 
     if use_3d:
@@ -906,6 +917,8 @@ def unified_attention_int4(
     softmax_segm_output: torch.Tensor | None = None,
     softmax_segm_max: torch.Tensor | None = None,
     softmax_segm_expsum: torch.Tensor | None = None,
+    use_causal: bool = True,
+    per_seq_causal_ptr: torch.Tensor | None = None,
 ) -> None:
     """Paged attention over the INT4 packed cache, writing into *out*.
 
@@ -945,6 +958,8 @@ def unified_attention_int4(
         softmax_segm_max=softmax_segm_max,
         softmax_segm_expsum=softmax_segm_expsum,
         packing_factor=_INT4_PACKING_FACTOR,
+        use_causal=use_causal,
+        per_seq_causal_ptr=per_seq_causal_ptr,
     )
 
     out_f = single_rht(out.float(), inverse=True) / rht_norm
