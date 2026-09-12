@@ -48,6 +48,7 @@ from transformers.models.qwen3_vl.video_processing_qwen3_vl import (
 )
 from transformers.video_utils import VideoMetadata
 
+import vllm.envs as envs
 from vllm.compilation.decorators import (
     should_torch_compile_mm_encoder,
     support_torch_compile,
@@ -622,6 +623,17 @@ class Qwen3_VisionTransformer(nn.Module):
             rope_parameters={"partial_rotary_factor": 0.5},
         )
 
+        vision_offloader = None
+        if envs.VLLM_VISION_CPU_OFFLOAD_GB > 0:
+            from vllm.model_executor.offloader.uva import UVAOffloader
+
+            vision_offloader = UVAOffloader(
+                int(envs.VLLM_VISION_CPU_OFFLOAD_GB * 1024**3)
+            )
+            # Bulk-copy each module for its forward. UVA zero-copy makes every
+            # GEMM reread operand tiles over PCIe and is much slower here.
+            vision_offloader.uva_offloading = False
+
         self.merger = Qwen3_VisionPatchMerger(
             d_model=vision_config.out_hidden_size,
             context_dim=self.hidden_size,
@@ -630,6 +642,8 @@ class Qwen3_VisionTransformer(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.merger",
         )
+        if vision_offloader is not None:
+            vision_offloader.wrap_modules(iter([self.merger]))
 
         self.deepstack_merger_list = nn.ModuleList(
             [
@@ -651,19 +665,22 @@ class Qwen3_VisionTransformer(nn.Module):
             dtype=torch.get_default_dtype(),
         )
 
+        blocks_iter = (
+            Qwen3_VisionBlock(
+                dim=self.hidden_size,
+                num_heads=self.num_heads,
+                mlp_hidden_dim=vision_config.intermediate_size,
+                act_fn=_ACTIVATION_REGISTRY[vision_config.hidden_act],
+                norm_layer=norm_layer,
+                quant_config=quant_config,
+                prefix=f"{prefix}.blocks.{layer_idx}",
+            )
+            for layer_idx in range(vision_config.depth)
+        )
         self.blocks = nn.ModuleList(
-            [
-                Qwen3_VisionBlock(
-                    dim=self.hidden_size,
-                    num_heads=self.num_heads,
-                    mlp_hidden_dim=vision_config.intermediate_size,
-                    act_fn=_ACTIVATION_REGISTRY[vision_config.hidden_act],
-                    norm_layer=norm_layer,
-                    quant_config=quant_config,
-                    prefix=f"{prefix}.blocks.{layer_idx}",
-                )
-                for layer_idx in range(vision_config.depth)
-            ]
+            vision_offloader.wrap_modules(blocks_iter)
+            if vision_offloader is not None
+            else list(blocks_iter)
         )
 
     @property
