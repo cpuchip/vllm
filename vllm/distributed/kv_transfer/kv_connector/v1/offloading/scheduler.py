@@ -322,6 +322,35 @@ class SchedulerOffloadConfig(NamedTuple):
                         f"({retention_interval}) must be a multiple of "
                         f"tokens_per_chunk ({config.tokens_per_chunk})."
                     )
+        # (syv) #33: the CPU offload pool allocates UNIFORM blocks sized for
+        # the largest group's chunk. A group with far smaller chunks (KVarN's
+        # promoted drafter SW group: 128-token chunks against 2176) burns a
+        # full block per tiny chunk, so a single long request can evict the
+        # entire CPU tier and cross-request reuse never hits. Warn with the
+        # arithmetic so nobody spends a day on silent zero-uplift.
+        _chunk_tokens = [
+            tokens_per_block * spec.blocks_per_chunk
+            for tokens_per_block in spec.tokens_per_block
+        ]
+        _max_chunk = max(_chunk_tokens) if _chunk_tokens else 0
+        for _idx, _tok in enumerate(_chunk_tokens):
+            if _tok * 4 <= _max_chunk:
+                logger.warning(
+                    "KV offloading: group %d has %d-token chunks against a "
+                    "%d-token maximum, and offload blocks are uniformly sized "
+                    "for the maximum. Every %d-token chunk of this group "
+                    "occupies a full block, so one long request can consume "
+                    "the whole CPU tier and evict all previously stored "
+                    "blocks -- cross-request reuse will likely never hit "
+                    "(issue #33). Until blocks are sized per group or this "
+                    "group is excluded, expect ~%dx more cpu_bytes_to_use "
+                    "than the KV bytes suggest.",
+                    _idx,
+                    _tok,
+                    _max_chunk,
+                    _tok,
+                    max(1, _max_chunk // max(1, _tok)),
+                )
 
         return cls(
             num_workers=vllm_config.parallel_config.world_size,
