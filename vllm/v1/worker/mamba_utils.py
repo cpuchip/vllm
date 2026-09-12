@@ -534,15 +534,15 @@ def preprocess_mamba_align_fused_kernel(
     state_idx = tl.load(state_idx_ptr + req_indices, mask=mask, other=-1)
     num_accepted = tl.load(num_accepted_tokens_ptr + req_indices, mask=mask, other=1)
 
-    src_off = tl.maximum(num_accepted - 1, 0)
-    tl.store(src_col_ptr + req_indices, state_idx, mask=mask)
-    tl.store(src_off_ptr + req_indices, src_off, mask=mask)
-
     num_computed = tl.load(num_computed_tokens_ptr + req_indices, mask=mask, other=0)
     query_start = tl.load(query_start_loc_ptr + offsets, mask=mask, other=0)
     query_end = tl.load(query_start_loc_ptr + offsets + 1, mask=mask, other=0)
     computed_after = num_computed + query_end - query_start
     new_state_idx = (computed_after + MAMBA_BLOCK_SIZE - 1) // MAMBA_BLOCK_SIZE - 1
+    src_off = tl.maximum(num_accepted - 1, 0)
+    src_col = tl.where((num_computed == 0) | (state_idx < 0) | (state_idx == new_state_idx), -1, state_idx)
+    tl.store(src_col_ptr + req_indices, src_col, mask=mask)
+    tl.store(src_off_ptr + req_indices, src_off, mask=mask)
     tl.store(state_idx_ptr + req_indices, new_state_idx, mask=mask)
     should_reset = (state_idx >= 0) & (state_idx != new_state_idx)
     tl.store(num_accepted_tokens_ptr + req_indices, 1, mask=mask & should_reset)
