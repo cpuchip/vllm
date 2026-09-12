@@ -1200,6 +1200,24 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
         """
         return 0
 
+    def cache_blocks(
+        self,
+        request: Request,
+        num_tokens: int,
+        retention_interval: int | None = None,
+    ) -> None:
+        # Prefix reuse is not meaningful for a rolling window. Skip the write
+        # path when the SW block and hash unit are not divisible in either
+        # direction, or when the scheduler boundary is finer than the SW
+        # block. The latter would make reachable_block_mask assert before
+        # resolve_block_hashes is reached.
+        if (
+            self.block_size % self.block_pool.hash_block_size != 0
+            or self.scheduler_block_size % self.block_size != 0
+        ):
+            return
+        super().cache_blocks(request, num_tokens, retention_interval=retention_interval)
+
 
 class CircularBufferManager(FullAttentionManager):
     """Claims the ring's single block per request; prefix caching disabled."""

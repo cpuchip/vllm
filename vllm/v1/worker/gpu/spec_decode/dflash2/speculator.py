@@ -97,6 +97,9 @@ def _selector_walk_kernel(
             IS_DRAFTING=True,
             USE_FP64=USE_FP64,
         )
+        # A degenerate distribution can produce NaN scores. Keep the walk in
+        # bounds; the verify step will reject any bad proposal.
+        index = tl.where(index >= top_k, 0, index)
         # vLLM 0.28.0's rejection sampler expects pre-temperature logits. With TRUNCATE
         # the cached row is the truncated proposal (-inf outside the kept support).
         realized = scores
@@ -160,7 +163,7 @@ class DFlash2Speculator(DFlashSpeculator):
             torch.arange(self.max_num_reqs, dtype=torch.int64, device=device)
             * self.num_query_per_req
         )
-        self._selector_tokens = torch.empty(
+        self._selector_tokens = torch.zeros(
             (self.max_num_reqs, self.draft_block),
             dtype=self.draft_tokens.dtype,
             device=device,
@@ -718,6 +721,7 @@ class DFlash2Speculator(DFlashSpeculator):
             hidden_states,
             anchor_token_ids,
         )
+        scores = torch.nan_to_num(scores, nan=-1e30, posinf=1e30, neginf=-1e30)
         self._sample_path(candidate_ids, scores, num_reqs)
         if self.draft_logits is not None:
             self._cache_draft_logits(candidate_ids, num_sample)
