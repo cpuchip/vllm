@@ -81,8 +81,14 @@ class DraftTokensHandler:
         )
 
     def set_draft_tokens(
-        self, input_batch: InputBatch, draft_tokens: torch.Tensor
+        self, input_batch: InputBatch, draft_tokens: torch.Tensor, num_draft: int | None = None
     ) -> None:
+        """num_draft: how many of the proposed tokens the scheduler should actually put up
+        for verification next step, when that is fewer than the speculator produced. The
+        DFlash2 lookup uses it to pay for a long verify block only while the request is
+        reproducing its context (dflash2/lookup.py)."""
+        if num_draft is not None:
+            draft_tokens = draft_tokens[:, :num_draft]
         if not input_batch.has_structured_output_reqs:
             # No draft token validation needs to be performed by
             # the scheduler for this batch. Record draft token widths only.

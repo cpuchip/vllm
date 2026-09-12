@@ -416,6 +416,37 @@ class DFlashQwen3DecoderLayer(nn.Module):
         return hidden_states, residual
 
 
+def _dense_kv_rows(attn: nn.Module) -> torch.Tensor:
+    """Return the K/V rows of a QKV projection as a dense matrix.
+
+    The W4A16 DFlash2 checkpoint uses compressed-tensors for qkv_proj. In
+    vLLM 0.28.0 that layer exposes packed weights rather than ``weight``;
+    context-KV precomputation still needs the dense K/V rows.
+    """
+    qkv = attn.qkv_proj
+    weight = getattr(qkv, "weight", None)
+    if weight is not None and weight.dim() == 2:
+        return weight[attn.q_size :]
+
+    packed, scale = qkv.weight_packed, qkv.weight_scale
+    out_features, in_features = int(packed.shape[0]), int(qkv.input_size)
+    bits = 32 * packed.shape[1] // in_features
+    from compressed_tensors.compressors.pack_quantized.base import unpack_from_int32
+
+    quantized = unpack_from_int32(
+        packed.data,
+        bits,
+        torch.Size([out_features, in_features]),
+        packed_dim=1,
+    )
+    group_size = in_features // scale.shape[1]
+    dense = (
+        quantized.to(torch.float32)
+        .reshape(out_features, in_features // group_size, group_size)
+        * scale.to(torch.float32)[..., None]
+    ).reshape(out_features, in_features)
+    dtype = scale.dtype if scale.dtype.is_floating_point else torch.bfloat16
+    return dense.to(dtype)[attn.q_size :]
 @support_torch_compile
 class DFlashQwen3Model(nn.Module):
     decoder_layer_cls = DFlashQwen3DecoderLayer
@@ -557,15 +588,12 @@ class DFlashQwen3Model(nn.Module):
         self._context_qkv_projs = [a.qkv_proj for a in layers_attn]
         self._context_q_sizes = [a.q_size for a in layers_attn]
 
-        # Quantized linear weights may use packed storage that cannot be
-        # consumed by F.linear; then each projection runs through its quant
-        # method (or the MXFP8 context projection, when there is one) and the
-        # fused buffers stay None.
+        # KV projection weights: [num_layers * 2 * kv_size, hidden_size]. _dense_kv_rows unpacks a
+        # compressed-tensors W4A16 qkv_proj, so a quantized drafter keeps the one fused GEMM as well.
+        # CPU-repacked weights cannot be read as rows; there each projection runs through its quant method.
         kv_weight = kv_bias = None
-        if _reads_raw_weights(self._context_qkv_projs):
-            # KV projection weights: [num_layers * 2 * kv_size, hidden_size]
-            kv_weights = [a.qkv_proj.weight[a.q_size :] for a in layers_attn]
-            kv_weight = torch.cat(kv_weights, dim=0)
+        if not current_platform.is_cpu():
+            kv_weight = torch.cat([_dense_kv_rows(a) for a in layers_attn], dim=0)
             if has_bias:
                 kv_biases = [a.qkv_proj.bias[a.q_size :] for a in layers_attn]
                 kv_bias = torch.cat(kv_biases, dim=0)
