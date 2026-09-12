@@ -184,6 +184,8 @@ if TYPE_CHECKING:
     VLLM_RAY_EXTRA_ENV_VARS_TO_COPY: str = ""
     VLLM_MARLIN_USE_ATOMIC_ADD: bool = False
     VLLM_MARLIN_INPUT_DTYPE: Literal["int8", "fp8"] | None = None
+    VLLM_MARLIN_INT8_INCLUDE_RE: str = ""
+    VLLM_MARLIN_INT8_EXCLUDE_RE: str = "lm_head|mtp"
     VLLM_HUMMING_ONLINE_QUANT_CONFIG: dict[str, Any] | None = None
     VLLM_HUMMING_INPUT_QUANT_CONFIG: dict[str, Any] | None = None
     VLLM_HUMMING_USE_F16_ACCUM: bool = False
@@ -1501,6 +1503,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # The activation dtype for marlin kernel
     "VLLM_MARLIN_INPUT_DTYPE": env_with_choices(
         "VLLM_MARLIN_INPUT_DTYPE", None, ["int8", "fp8"]
+    ),
+    # syv patch: per-layer regex selection for the Marlin int8/fp8 activation
+    # path (registered here so they take part in the torch.compile cache key)
+    "VLLM_MARLIN_INT8_INCLUDE_RE": lambda: os.environ.get(
+        "VLLM_MARLIN_INT8_INCLUDE_RE", ""
+    ),
+    "VLLM_MARLIN_INT8_EXCLUDE_RE": lambda: os.environ.get(
+        "VLLM_MARLIN_INT8_EXCLUDE_RE", "lm_head|mtp"
     ),
     # The online quantization dtype for humming kernel
     "VLLM_HUMMING_ONLINE_QUANT_CONFIG": lambda: maybe_convert_json_str_or_file(
