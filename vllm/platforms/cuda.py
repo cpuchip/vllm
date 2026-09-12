@@ -151,6 +151,7 @@ def _get_backend_priorities(
                 AttentionBackendEnum.FLASH_ATTN,
                 AttentionBackendEnum.TRITON_ATTN,
                 AttentionBackendEnum.FLEX_ATTENTION,
+                AttentionBackendEnum.KVARN,
                 AttentionBackendEnum.TURBOQUANT,
             ]
         else:
@@ -159,6 +160,7 @@ def _get_backend_priorities(
                 AttentionBackendEnum.FLASHINFER,
                 AttentionBackendEnum.TRITON_ATTN,
                 AttentionBackendEnum.FLEX_ATTENTION,
+                AttentionBackendEnum.KVARN,
                 AttentionBackendEnum.TURBOQUANT,
             ]
 
@@ -350,6 +352,70 @@ class CudaPlatformBase(Platform):
                 "setting in %%USERPROFILE%%\\.wslconfig and run "
                 "`wsl --shutdown`."
             )
+
+        # KVarN keeps a fixed-size fp16 tail pool for each active request.
+        # Bound scheduler concurrency to the pool budget before worker startup;
+        # the backend itself cannot safely grow this allocation after CUDA graph
+        # buffers have been created.
+        cache_config = vllm_config.cache_config
+        cache_dtype = getattr(cache_config, "cache_dtype", None)
+        if (
+            model_config is not None
+            and isinstance(cache_dtype, str)
+            and cache_dtype.startswith("kvarn_")
+            and not getattr(model_config, "use_mla", False)
+        ):
+            from vllm.model_executor.layers.quantization.kvarn.config import (
+                KVarNConfig,
+            )
+
+            head_size = model_config.get_head_size()
+            if head_size not in (128, 256, 512):
+                raise ValueError(
+                    f"{cache_dtype} requires head_dim in (128, 256, 512), "
+                    f"but this model has head_dim={head_size}."
+                )
+
+            # KVarN's dense backend has no sliding-window mask. Preserve the
+            # full-precision SW layers in hybrid models unless explicitly opted in.
+            hf_text_config = getattr(model_config, "hf_text_config", None)
+            layer_types = getattr(hf_text_config, "layer_types", None)
+            has_swa = (
+                "sliding_attention" in layer_types
+                if layer_types
+                else getattr(hf_text_config, "sliding_window", None) is not None
+            )
+            skip_layers = cache_config.kv_cache_dtype_skip_layers
+            if os.environ.get("KVARN_QUANT_SLIDING") == "1":
+                while "sliding_window" in skip_layers:
+                    skip_layers.remove("sliding_window")
+            elif has_swa and "sliding_window" not in skip_layers:
+                skip_layers.append("sliding_window")
+
+            kvarn_cfg = KVarNConfig.from_cache_dtype(cache_dtype, head_size)
+            weight_bytes = kvarn_cfg.estimate_weight_bytes(
+                model_config.model,
+                tensor_parallel_size=parallel_config.tensor_parallel_size,
+            )
+            supported = kvarn_cfg.max_supported_seqs(
+                total_gpu_bytes=cls.get_device_total_memory(),
+                num_kv_heads=model_config.get_num_kv_heads(parallel_config),
+                num_layers=KVarNConfig.num_kvarn_layers(
+                    model_config, parallel_config
+                ),
+                max_num_batched_tokens=scheduler_config.max_num_batched_tokens,
+                gpu_memory_utilization=cache_config.gpu_memory_utilization,
+                weight_bytes=weight_bytes,
+            )
+            if scheduler_config.max_num_seqs > supported:
+                logger.warning(
+                    "KVarN (%s): capping max_num_seqs %d -> %d for the fp16 "
+                    "tail-pool budget.",
+                    cache_dtype,
+                    scheduler_config.max_num_seqs,
+                    supported,
+                )
+                scheduler_config.max_num_seqs = supported
 
     @classmethod
     def get_current_memory_usage(
