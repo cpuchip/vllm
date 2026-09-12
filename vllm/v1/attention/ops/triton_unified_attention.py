@@ -856,9 +856,6 @@ def unified_attention(
     # Sub-byte packed mode (INT4) needs a bespoke kernel (split-dot +
     # sub-byte unpack); everything else goes through the core kernel below.
     if kv_quant_mode == KVQuantMode.INT4_PER_TOKEN_HEAD:
-        assert use_causal and not use_per_seq_causal, (
-            "INT4_PER_TOKEN_HEAD only supports causal attention"
-        )
         from vllm.v1.attention.ops.int4_per_token_head import (
             unified_attention_int4,
         )
@@ -891,6 +888,8 @@ def unified_attention(
             softmax_segm_output=softmax_segm_output,
             softmax_segm_max=softmax_segm_max,
             softmax_segm_expsum=softmax_segm_expsum,
+            use_causal=use_causal,
+            per_seq_causal_ptr=per_seq_causal_ptr,
         )
         return
 
