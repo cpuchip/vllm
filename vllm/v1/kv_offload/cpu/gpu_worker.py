@@ -106,7 +106,9 @@ def compute_sub_block_ptrs(
     assert skip_count < blocks_per_chunk
 
     num_sub_blocks = len(output)
-    base_ptr = tensor.data_ptr()
+    # (fix 2026-08-28) device-VA translation for non-UVA platforms (delta 0
+    # on native Linux; the attribute exists only on offload-mmap CPU views).
+    base_ptr = tensor.data_ptr() + getattr(tensor, "_offload_ptr_delta", 0)
     row_stride = tensor.stride(0)
 
     if blocks_per_chunk == 1:
@@ -268,6 +270,79 @@ def pin_mmap_region(region: SharedOffloadRegion) -> None:
         total_size / 1e9,
         len(addresses),
     )
+
+    # (fix 2026-08-28, chunked since vLLM #51081) Host VA == device VA only under
+    # true UVA. WSL2 registers successfully but maps the region at a different
+    # device address, and kernels dereferencing the host VA fault (IMA). Ask the
+    # API for each registered chunk's device pointer and carry the delta into
+    # pointer arithmetic. One delta serves the region only if every chunk maps at
+    # the same offset; a region up to MAX_HOST_REGISTER_CHUNK_BYTES is one chunk.
+    # The delta is 0 on native Linux, so nothing changes there.
+    import ctypes as _ctypes
+    import glob as _glob
+    import os as _os
+
+    def _load_cudart():
+        # The process image first: torch has already dlopen'd cudart, and
+        # standard pip installs ship ONLY versioned sonames at absolute
+        # wheel paths never on the loader search path (so a bare
+        # CDLL("libcudart.so") fails on most native Linux boxes).
+        candidates = [None, "libcudart.so", "libcudart.so.13",
+                      "libcudart.so.12"]
+        import torch as _torch
+        _sp = _os.path.dirname(_os.path.dirname(_torch.__file__))
+        candidates += sorted(_glob.glob(
+            _os.path.join(_sp, "nvidia", "*", "lib", "libcudart.so*")))
+        for _cand in candidates:
+            try:
+                _lib = _ctypes.CDLL(_cand)
+                _lib.cudaHostGetDevicePointer  # symbol must resolve
+                return _lib
+            except (OSError, AttributeError):
+                continue
+        return None
+
+    try:
+        _libcudart = _load_cudart()
+        if _libcudart is None:
+            raise RuntimeError(
+                "KV offload: cudart with cudaHostGetDevicePointer not "
+                "loadable from the process image, system sonames, or the "
+                "wheel path; cannot verify device addressability of the "
+                "registered mmap, refusing unsafe zero-copy transfers.")
+        _deltas = set()
+        for _address in addresses:
+            _devptr = _ctypes.c_void_p()
+            _rc = _libcudart.cudaHostGetDevicePointer(
+                _ctypes.byref(_devptr), _ctypes.c_void_p(_address), 0)
+            if _rc != 0 or not _devptr.value:
+                # Fail loud: host VAs on a platform where the device pointer is
+                # unavailable is the silent-unsafe shape this fix removes.
+                raise RuntimeError(
+                    "KV offload: cudaHostGetDevicePointer failed "
+                    f"(rc={_rc}) for the registered mmap. Zero-copy kernels "
+                    "would dereference unmapped host addresses (illegal "
+                    "memory access). Refusing to start with the "
+                    "OffloadingConnector on this platform.")
+            _deltas.add(_devptr.value - _address)
+        if len(_deltas) != 1:
+            raise RuntimeError(
+                "KV offload: the registered chunks map at different device "
+                f"offsets ({sorted(_deltas)}), so one translation cannot "
+                "serve the region. Keep the CPU tier at or below "
+                f"{MAX_HOST_REGISTER_CHUNK_BYTES / 1024**3:.0f} GiB on this "
+                "platform, or disable offload.")
+        region.device_delta = _deltas.pop()
+        if region.device_delta != 0:
+            logger.warning(
+                "KV offload mmap: device VA differs from host VA "
+                "(delta=%d), a non-UVA platform (e.g. WSL2); "
+                "translating kernel addresses.", region.device_delta)
+    except OSError as _e:
+        raise RuntimeError(
+            "KV offload: could not query the device pointer for the "
+            f"registered mmap ({_e}); refusing unsafe zero-copy "
+            "transfers.") from _e
 
 
 def _new_descriptor_buffers(
@@ -843,6 +918,9 @@ class CPUOffloadingWorker(OffloadingWorker):
                 )
             elif mmap_region is not None:
                 cpu_tensor = mmap_region.create_next_worker_view(cpu_page_size_bytes)
+                # (fix 2026-08-28) ride the device-VA delta with the view
+                cpu_tensor._offload_ptr_delta = (
+                    getattr(mmap_region, "device_delta", 0) or 0)
             else:
                 t0 = time.monotonic()
                 cpu_tensor = torch.zeros(
