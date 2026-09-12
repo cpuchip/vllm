@@ -513,9 +513,7 @@ class DFlash2Speculator(DFlashSpeculator):
         self.draft_max_seq_len = min(
             max_seq_len + self.num_query_per_req, self.max_model_len
         )
-        self.last_num_emitted = (
-            (num_sampled - num_rejected) if num_sampled is not None else None
-        )
+        self.last_num_emitted = num_sampled if num_sampled is not None else None
 
         if aux_hidden_states:
             hidden_states = self.model.combine_hidden_states(
