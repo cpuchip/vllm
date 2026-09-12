@@ -196,6 +196,8 @@ if TYPE_CHECKING:
     VLLM_MARLIN_TUNE_DIR: str = ""
     VLLM_SPEC_DECODE_ATTN: bool = False
     VLLM_DRAFT_TOPK_TOPP: bool = True
+    # GiB of vision-tower weights to keep in pinned host memory; 0 disables.
+    VLLM_VISION_CPU_OFFLOAD_GB: float = 0.0
     VLLM_HUMMING_MOE_GEMM_TYPE: Literal["indexed", "grouped", "auto"] | None = None
     VLLM_B12X_MOE_FP4_FORCE_A16: bool = False
     VLLM_DEEPEPLL_NVFP4_DISPATCH: bool = False
@@ -1533,6 +1535,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_MARLIN_TUNE_DIR": lambda: os.environ.get("VLLM_MARLIN_TUNE_DIR", ""),
     "VLLM_SPEC_DECODE_ATTN": lambda: os.environ.get("VLLM_SPEC_DECODE_ATTN", "0") == "1",
     "VLLM_DRAFT_TOPK_TOPP": lambda: os.environ.get("VLLM_DRAFT_TOPK_TOPP", "1") == "1",
+    "VLLM_VISION_CPU_OFFLOAD_GB": lambda: float(
+        os.environ.get("VLLM_VISION_CPU_OFFLOAD_GB", "0")
+    ),
     # The activation dtype config for humming kernel
     "VLLM_HUMMING_INPUT_QUANT_CONFIG": lambda: maybe_convert_json_str_or_file(
         os.environ.get("VLLM_HUMMING_INPUT_QUANT_CONFIG", None)
