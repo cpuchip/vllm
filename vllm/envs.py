@@ -193,6 +193,36 @@ if TYPE_CHECKING:
     VLLM_HUMMING_ONLINE_QUANT_CONFIG: dict[str, Any] | None = None
     VLLM_HUMMING_INPUT_QUANT_CONFIG: dict[str, Any] | None = None
     VLLM_HUMMING_USE_F16_ACCUM: bool = False
+    # syv patch: single-user speed knobs (registered so they take part in the
+    # torch.compile cache key; VLLM_MARLIN_TUNE changes the Marlin workspace shape)
+    VLLM_MARLIN_TUNE: bool = False
+    VLLM_MARLIN_TUNE_DIR: str = ""
+    VLLM_DRAFT_TOPK_TOPP: bool = True
+    VLLM_PREFILL_ATTN: str = ""
+    VLLM_DFLASH2_LOOKUP: bool = False
+    VLLM_DFLASH2_GRAPH_BOTH: bool = True
+    VLLM_DFLASH2_DRAFT_TOPK_TOPP: bool = True
+    VLLM_DFLASH2_LOOKUP_NMIN: int = 6
+    VLLM_DFLASH2_LOOKUP_NMAX: int = 12
+    VLLM_DFLASH2_LOOKUP_NSTRONG: int = 6
+    VLLM_DFLASH2_LOOKUP_AGREE: int = 0
+    VLLM_DFLASH2_LOOKUP_NMIN_TAIL: int = 4
+    VLLM_DFLASH2_LOOKUP_LONGMIN: int = 6
+    VLLM_DFLASH2_LOOKUP_CHEAP_CTX: int = 0
+    VLLM_DFLASH2_LOOKUP_SEARCH: int = 1 << 30
+    VLLM_DFLASH2_LOOKUP_ADAPTIVE: bool = True
+    VLLM_DFLASH2_LOOKUP_STICKY: int = 3
+    VLLM_DFLASH2_CHAIN: bool = False
+    VLLM_DFLASH2_CHAIN_MINMATCH: int = 8
+    VLLM_DFLASH2_CHAIN_LOG_SEC: float = 30.0
+    VLLM_DFLASH2_CHAIN_GREEDY_ONLY: bool = True
+    VLLM_INT4_MQ_3D: bool = False
+    VLLM_INT4_MQ_3D_DEBUG: bool = False
+    VLLM_MAMBA_ALIGN_KEEP_CHECKPOINTS: bool = False
+    VLLM_DRAFT_TEMP_SCALE: float = 1.0
+    VLLM_MARLIN_REPACK_STAGED: str | None = None
+    # GiB of vision-tower weights to keep in pinned host memory; 0 disables.
+    VLLM_VISION_CPU_OFFLOAD_GB: float = 0.0
     VLLM_HUMMING_MOE_GEMM_TYPE: Literal["indexed", "grouped", "auto"] | None = None
     VLLM_B12X_MOE_FP4_FORCE_A16: bool = False
     VLLM_DEEPEPLL_NVFP4_DISPATCH: bool = False
@@ -1522,6 +1552,44 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # The online quantization dtype for humming kernel
     "VLLM_HUMMING_ONLINE_QUANT_CONFIG": lambda: maybe_convert_json_str_or_file(
         os.environ.get("VLLM_HUMMING_ONLINE_QUANT_CONFIG", None)
+    ),
+    # syv patch: single-user speed knobs
+    "VLLM_MARLIN_TUNE": lambda: os.environ.get("VLLM_MARLIN_TUNE", "0") == "1",
+    "VLLM_MARLIN_TUNE_DIR": lambda: os.environ.get("VLLM_MARLIN_TUNE_DIR", ""),
+    "VLLM_DRAFT_TOPK_TOPP": lambda: os.environ.get("VLLM_DRAFT_TOPK_TOPP", "1") == "1",
+    # int8 (or fp16 scaffold) Triton prefill attention for hd256; "" keeps FA2
+    "VLLM_PREFILL_ATTN": lambda: os.environ.get("VLLM_PREFILL_ATTN", ""),
+    # split-KV verify kernel: cap on query rows per request (0 = 1 + num_speculative_tokens)
+    # DFlash2 lookup-augmented drafting and drafter-free chains (dflash2/speculator.py, lookup.py)
+    "VLLM_DFLASH2_LOOKUP": lambda: os.environ.get("VLLM_DFLASH2_LOOKUP", "0") == "1",
+    "VLLM_DFLASH2_GRAPH_BOTH": lambda: os.environ.get("VLLM_DFLASH2_GRAPH_BOTH", "1") == "1",
+    "VLLM_DFLASH2_DRAFT_TOPK_TOPP": lambda: os.environ.get("VLLM_DFLASH2_DRAFT_TOPK_TOPP", "1") == "1",
+    "VLLM_DFLASH2_LOOKUP_NMIN": lambda: int(os.environ.get("VLLM_DFLASH2_LOOKUP_NMIN", "6")),
+    "VLLM_DFLASH2_LOOKUP_NMAX": lambda: int(os.environ.get("VLLM_DFLASH2_LOOKUP_NMAX", "12")),
+    "VLLM_DFLASH2_LOOKUP_NSTRONG": lambda: int(os.environ.get("VLLM_DFLASH2_LOOKUP_NSTRONG", "6")),
+    "VLLM_DFLASH2_LOOKUP_AGREE": lambda: int(os.environ.get("VLLM_DFLASH2_LOOKUP_AGREE", "0")),
+    "VLLM_DFLASH2_LOOKUP_NMIN_TAIL": lambda: int(os.environ.get("VLLM_DFLASH2_LOOKUP_NMIN_TAIL", "4")),
+    "VLLM_DFLASH2_LOOKUP_LONGMIN": lambda: int(os.environ.get("VLLM_DFLASH2_LOOKUP_LONGMIN", "6")),
+    "VLLM_DFLASH2_LOOKUP_CHEAP_CTX": lambda: int(os.environ.get("VLLM_DFLASH2_LOOKUP_CHEAP_CTX", "0")),
+    "VLLM_DFLASH2_LOOKUP_SEARCH": lambda: int(os.environ.get("VLLM_DFLASH2_LOOKUP_SEARCH", str(1 << 30))),
+    "VLLM_DFLASH2_LOOKUP_ADAPTIVE": lambda: os.environ.get("VLLM_DFLASH2_LOOKUP_ADAPTIVE", "1") == "1",
+    "VLLM_DFLASH2_LOOKUP_STICKY": lambda: int(os.environ.get("VLLM_DFLASH2_LOOKUP_STICKY", "3")),
+    "VLLM_DFLASH2_CHAIN": lambda: os.environ.get("VLLM_DFLASH2_CHAIN", "0") == "1",
+    "VLLM_DFLASH2_CHAIN_MINMATCH": lambda: int(os.environ.get("VLLM_DFLASH2_CHAIN_MINMATCH", "8")),
+    "VLLM_DFLASH2_CHAIN_LOG_SEC": lambda: float(os.environ.get("VLLM_DFLASH2_CHAIN_LOG_SEC", "30")),
+    "VLLM_DFLASH2_CHAIN_GREEDY_ONLY": lambda: os.environ.get("VLLM_DFLASH2_CHAIN_GREEDY_ONLY", "1") == "1",
+    # split-KV verify kernel: force the query-row tile (0 = pick by row count)
+    # int4 per-token-head KV: the multi-query 3D verify path and its debug print
+    "VLLM_INT4_MQ_3D": lambda: os.environ.get("VLLM_INT4_MQ_3D", "0") == "1",
+    "VLLM_INT4_MQ_3D_DEBUG": lambda: os.environ.get("VLLM_INT4_MQ_3D_DEBUG", "0") == "1",
+    # align-mode Mamba: hold each running request's reachable state snapshots until it finishes (fork #52)
+    "VLLM_MAMBA_ALIGN_KEEP_CHECKPOINTS": lambda: os.environ.get("VLLM_MAMBA_ALIGN_KEEP_CHECKPOINTS", "0") == "1",
+    # MTP drafter: temperature scale on the draft distribution (1.0 = the target's)
+    "VLLM_DRAFT_TEMP_SCALE": lambda: float(os.environ.get("VLLM_DRAFT_TEMP_SCALE", "1.0")),
+    # sm80 Marlin repack staging buffer: "1"/"0" override, unset = on for compute capability 8.0 only
+    "VLLM_MARLIN_REPACK_STAGED": lambda: os.environ.get("VLLM_MARLIN_REPACK_STAGED"),
+    "VLLM_VISION_CPU_OFFLOAD_GB": lambda: float(
+        os.environ.get("VLLM_VISION_CPU_OFFLOAD_GB", "0")
     ),
     # The activation dtype config for humming kernel
     "VLLM_HUMMING_INPUT_QUANT_CONFIG": lambda: maybe_convert_json_str_or_file(
