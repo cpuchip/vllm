@@ -1160,6 +1160,37 @@ class FlashAttentionImpl(AttentionImpl):
                     block_table = block_table[:, :num_pages]
                     num_splits = 1
 
+                # syv patch: split-KV Triton attention for speculative-decode
+                # batches (1 < queries/request <= 10). FA2 does not split the KV
+                # sequence when max_seqlen_q > 1, leaving most SMs idle.
+                if (
+                    _spec_attn_enabled()
+                    and 1 < max_seqlen_q <= _spec_attn_qmax(self.num_heads // self.num_kv_heads)
+                    and not is_quantized_kv_cache(self.kv_cache_dtype)
+                    and (
+                        sliding_window_size is None
+                        or (sliding_window_size[0] < 0 and sliding_window_size[1] < 0)
+                    )
+                    and not self.logits_soft_cap
+                    and self.alibi_slopes is None
+                    and self.sinks is None
+                    and causal is True
+                    and mm_mask_mod is None
+                    and rswa_mask_mod_fn is None
+                ):
+                    _spec_attn_run(
+                        self,
+                        query[:num_actual_tokens],
+                        key_cache,
+                        value_cache,
+                        output[:num_actual_tokens],
+                        cu_seqlens_q,
+                        seqused_k,
+                        block_table,
+                        max_seqlen_q,
+                    )
+                    return output
+
                 flash_attn_varlen_func(
                     q=query[:num_actual_tokens],
                     k=key_cache,
@@ -1833,3 +1864,61 @@ def cascade_attention(
 
     # Merge prefix and suffix outputs, and store the result in output.
     merge_attn_states(output, prefix_output, prefix_lse, suffix_output, suffix_lse)
+
+
+# ---- syv patch: split-KV spec-decode attention -------------------------------
+_SPEC_ATTN = {}
+
+
+def _spec_attn_enabled() -> bool:
+    import os
+
+    return os.environ.get("VLLM_SPEC_DECODE_ATTN", "0") == "1"
+
+
+_SPEC_ATTN_QMAX: int | None = None
+
+
+def _spec_attn_qmax(group: int) -> int:
+    # The kernel tiles the query rows itself, so the cap is on query tokens per request
+    # rather than on q_len * group (which used to stop a verify block longer than 10).
+    # It is fixed for the life of the server: the partial buffers are sized for it once,
+    # and a captured CUDA graph holds their addresses.
+    global _SPEC_ATTN_QMAX
+    if _SPEC_ATTN_QMAX is None:
+        import os
+
+        from vllm.config import get_current_vllm_config
+        from vllm.v1.attention.ops.spec_decode_attn import BLOCK_M, QMAX_TOKENS
+
+        n = 0
+        try:
+            spec = get_current_vllm_config().speculative_config
+            n = 1 + (spec.num_speculative_tokens if spec is not None else 0)
+        except Exception:
+            n = 0
+        n = int(os.environ.get("VLLM_SPEC_DECODE_ATTN_QMAX", n or 0)) or n
+        _SPEC_ATTN_QMAX = min(QMAX_TOKENS, max(n, BLOCK_M // group))
+    return _SPEC_ATTN_QMAX
+
+
+def _spec_attn_run(impl, q, key_cache, value_cache, out, cu_seqlens_q, seqused_k, block_table, max_seqlen_q):
+    from vllm.v1.attention.ops.spec_decode_attn import SpecDecodeAttention
+
+    key = (impl.num_heads, impl.head_size, q.device)
+    att = _SPEC_ATTN.get(key)
+    if att is None:
+        from vllm.config import get_current_vllm_config
+
+        try:
+            max_reqs = get_current_vllm_config().scheduler_config.max_num_seqs
+        except Exception:
+            max_reqs = 256
+        max_reqs = max(max_reqs, cu_seqlens_q.shape[0] - 1)
+        att = SpecDecodeAttention(
+            max_reqs, impl.num_heads, impl.head_size, q.device,
+            qmax=_spec_attn_qmax(impl.num_heads // impl.num_kv_heads),
+        )
+        _SPEC_ATTN[key] = att
+    att.run(q, key_cache, value_cache, out, cu_seqlens_q, seqused_k, block_table, impl.scale,
+            cu_seqlens_q.shape[0] - 1, max_seqlen_q)
