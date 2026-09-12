@@ -40,6 +40,11 @@ from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
     triton_reshape_and_cache_flash_per_token_head_quant,
 )
 from vllm.v1.attention.ops.triton_unified_attention import unified_attention
+from vllm.v1.attention.backends.flash_attn import (  # syv patch
+    _spec_attn_enabled,
+    _spec_attn_qmax,
+    _spec_attn_run,
+)
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     KVQuantMode,
@@ -648,6 +653,44 @@ class TritonAttentionImpl(AttentionImpl):
         softmax_segm_expsum = attn_metadata.softmax_segm_expsum
 
         mm_prefix_range_tensor = attn_metadata.mm_prefix_range_tensor
+
+        # syv patch: the split-KV Triton verify attention (patches/spec-decode-attn.patch),
+        # which vLLM's own unified attention cannot do here -- it refuses to split the KV
+        # sequence whenever max_seqlen_q > 1 (triton_unified_attention.py, `use_3d`), and
+        # every DFlash2 step is a multi-query verify. Measured at a 128k context, 8 query
+        # tokens: 1.3 ms per layer against unified attention's 7.4 ms.
+        # int8 per-token-head only: the kernel folds the per-(token, head) scales in after
+        # each dot, which is exact because they are constant along the head dim. The
+        # drafter's own sliding-window layers are excluded by the window test below.
+        if (
+            _spec_attn_enabled()
+            and self._kv_quant_mode == KVQuantMode.INT8_PER_TOKEN_HEAD
+            and k_scale_cache is not None
+            and 1 < max_seqlen_q <= _spec_attn_qmax(self.num_heads // self.num_kv_heads)
+            and attn_metadata.causal
+            and (self.sliding_window is None or self.sliding_window == (-1, -1))
+            and not self.logits_soft_cap
+            and self.alibi_slopes is None
+            and self.sinks is None
+            and self.chunk_lookback == -1
+            and mm_prefix_range_tensor is None
+            and attn_metadata.rswa_prefix_lens is None
+            and output_scale is None
+        ):
+            _spec_attn_run(
+                self,
+                query[:num_actual_tokens],
+                key_cache,
+                value_cache,
+                output[:num_actual_tokens],
+                cu_seqlens_q,
+                seqused_k,
+                block_table,
+                max_seqlen_q,
+                k_scale_cache,
+                v_scale_cache,
+            )
+            return output
 
         unified_attention(
             q=query[:num_actual_tokens],

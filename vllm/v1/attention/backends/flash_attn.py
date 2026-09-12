@@ -1899,7 +1899,7 @@ def _spec_attn_qmax(group: int) -> int:
     return _SPEC_ATTN_QMAX
 
 
-def _spec_attn_run(impl, q, key_cache, value_cache, out, cu_seqlens_q, seqused_k, block_table, max_seqlen_q):
+def _spec_attn_run(impl, q, key_cache, value_cache, out, cu_seqlens_q, seqused_k, block_table, max_seqlen_q, k_scale_cache=None, v_scale_cache=None):
     from vllm.v1.attention.ops.spec_decode_attn import SpecDecodeAttention
 
     key = (impl.num_heads, impl.head_size, q.device)
@@ -1918,4 +1918,5 @@ def _spec_attn_run(impl, q, key_cache, value_cache, out, cu_seqlens_q, seqused_k
         )
         _SPEC_ATTN[key] = att
     att.run(q, key_cache, value_cache, out, cu_seqlens_q, seqused_k, block_table, impl.scale,
-            cu_seqlens_q.shape[0] - 1, max_seqlen_q)
+            cu_seqlens_q.shape[0] - 1, max_seqlen_q,
+            k_scale_cache=k_scale_cache, v_scale_cache=v_scale_cache)
