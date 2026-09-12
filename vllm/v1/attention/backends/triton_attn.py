@@ -57,6 +57,10 @@ logger = init_logger(__name__)
 # constants
 MIN_LAUNCH_GRID_SIZE_2D = 128  # Minimum launch grid size of 2D kernel
 NUM_PAR_SOFTMAX_SEGMENTS = 16  # Number of parallel tiled softmax segments
+# Max query tokens PER SEQUENCE eligible for the 3D path. ONE source: it bounds both
+# eligibility (max_seqlen_q) and allocation (scratch_token_capacity_3d), so the two can
+# never drift apart the way a literal in the dispatch site did.
+MAX_QUERY_LEN_3D = 16
 
 
 @dataclass
@@ -77,7 +81,9 @@ class TritonAttentionMetadata:
     block_table: torch.Tensor
     slot_mapping: torch.Tensor
 
-    seq_threshold_3D: int
+    seq_threshold_3D: int          # SEQUENCES  (policy)
+    max_query_len_3d: int          # QUERY TOKENS PER SEQUENCE  (eligibility)
+    scratch_token_capacity_3d: int  # TOTAL QUERY TOKENS  (allocation)
     num_par_softmax_segments: int
     softmax_segm_output: torch.Tensor
     softmax_segm_max: torch.Tensor
@@ -158,9 +164,53 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
 
         self.num_par_softmax_segments = NUM_PAR_SOFTMAX_SEGMENTS
         headdim_padded = next_power_of_2(self.headdim)
+
+        # ---- UNIT SPLIT ------------------------------------------------------------
+        # These three quantities were one variable, in three different units. The
+        # scratch buffers are indexed by QUERY TOKEN, but were sized by
+        # seq_threshold_3D, a SEQUENCE policy -- and in capture-enabled mode that
+        # policy is snapped to the nearest decode capture size, which on this config
+        # shrinks it 32 -> 8. The result was a silent 2D fallback for every
+        # multi-query batch of 9..16 tokens, in capture-enabled mode only, i.e. the
+        # only mode that ships. Measured: q=9 falls back with q_token_capacity_failed
+        # in capture-enabled and runs 3D fully eager, same config, same request.
+        #
+        #   self.seq_threshold_3D        -- SEQUENCES.  Policy. Unchanged here (the
+        #                                   capture-snap question is a separate change).
+        #   self.max_query_len_3d        -- QUERY TOKENS PER SEQUENCE. Eligibility.
+        #   self.scratch_token_capacity_3d -- TOTAL QUERY TOKENS. Allocation.
+        #
+        # The bound is derived from the engine's own config objects, not from an
+        # observed run, the environment, or a launcher default. Eligibility already
+        # requires num_seqs <= seq_threshold_3D, and no batch can carry more query
+        # tokens than the scheduler will place in one, so this is the smallest
+        # capacity that can hold every policy-eligible batch.
+        self.max_query_len_3d = MAX_QUERY_LEN_3D
+        _sched = self.vllm_config.scheduler_config
+        self.scratch_token_capacity_3d = min(
+            _sched.max_num_batched_tokens,
+            min(_sched.max_num_seqs, self.seq_threshold_3D) * self.max_query_len_3d,
+        )
+
+        _rows = self.scratch_token_capacity_3d
+        _row_bytes = 4 * (
+            self.num_heads_q * self.num_par_softmax_segments * headdim_padded
+            + 2 * self.num_heads_q * self.num_par_softmax_segments
+        )
+        # Bind the inputs and the resulting cost into the boot record: a capacity that
+        # cannot be read back at boot is a capacity nobody can audit later.
+        logger.info(
+            "int4 3D scratch: capacity=%d query tokens (min of max_num_batched_tokens=%d, "
+            "min(max_num_seqs=%d, seq_threshold_3D=%d) * max_query_len_3d=%d); "
+            "%d B/row, %.2f MiB for this instance",
+            _rows, _sched.max_num_batched_tokens, _sched.max_num_seqs,
+            self.seq_threshold_3D, self.max_query_len_3d,
+            _row_bytes, _row_bytes * _rows / 2**20,
+        )
+
         self.softmax_segm_output = torch.empty(
             (
-                self.seq_threshold_3D,
+                _rows,
                 self.num_heads_q,
                 self.num_par_softmax_segments,
                 headdim_padded,
@@ -169,15 +219,24 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
             device=device,
         )
         self.softmax_segm_max = torch.empty(
-            (self.seq_threshold_3D, self.num_heads_q, self.num_par_softmax_segments),
+            (_rows, self.num_heads_q, self.num_par_softmax_segments),
             dtype=torch.float32,
             device=device,
         )
         self.softmax_segm_expsum = torch.empty(
-            (self.seq_threshold_3D, self.num_heads_q, self.num_par_softmax_segments),
+            (_rows, self.num_heads_q, self.num_par_softmax_segments),
             dtype=torch.float32,
             device=device,
         )
+        # All three buffers must agree with the DECLARED capacity. One oversized
+        # buffer can otherwise mask another undersized one until a different reducer
+        # path is taken.
+        assert (
+            self.softmax_segm_output.shape[0]
+            == self.softmax_segm_max.shape[0]
+            == self.softmax_segm_expsum.shape[0]
+            == self.scratch_token_capacity_3d
+        ), "int4 3D scratch buffers disagree with the declared token capacity"
         self.rswa_window = model_config.rswa_window
         self.persistent_rswa_prefix_lens: torch.Tensor | None = None
         if self.rswa_window is not None:
@@ -246,6 +305,8 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
             suffix_kv_lens=suffix_kv_lens,
             prefix_scheduler_metadata=prefix_scheduler_metadata,
             seq_threshold_3D=self.seq_threshold_3D,
+            max_query_len_3d=self.max_query_len_3d,
+            scratch_token_capacity_3d=self.scratch_token_capacity_3d,
             num_par_softmax_segments=self.num_par_softmax_segments,
             softmax_segm_output=self.softmax_segm_output,
             softmax_segm_max=self.softmax_segm_max,
@@ -651,6 +712,8 @@ class TritonAttentionImpl(AttentionImpl):
         block_table = attn_metadata.block_table
 
         seq_threshold_3D = attn_metadata.seq_threshold_3D
+        max_query_len_3d = attn_metadata.max_query_len_3d
+        scratch_token_capacity_3d = attn_metadata.scratch_token_capacity_3d
         num_par_softmax_segments = attn_metadata.num_par_softmax_segments
         softmax_segm_output = attn_metadata.softmax_segm_output
         softmax_segm_max = attn_metadata.softmax_segm_max
@@ -716,6 +779,8 @@ class TritonAttentionImpl(AttentionImpl):
             k_descale=k_descale,
             v_descale=v_descale,
             seq_threshold_3D=seq_threshold_3D,
+            max_query_len_3d=max_query_len_3d,
+            scratch_token_capacity_3d=scratch_token_capacity_3d,
             num_par_softmax_segments=num_par_softmax_segments,
             softmax_segm_output=softmax_segm_output,
             softmax_segm_max=softmax_segm_max,
