@@ -12,6 +12,7 @@ kernel, the RHT transform, and the public ``reshape_and_cache_int4`` /
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
 import torch
@@ -741,16 +742,41 @@ def _launch_packed_attn(
         head_size, sliding_window_val, q.element_size(), is_prefill=False
     )
 
+    # syv-fork (fermion, 2026-08-27) — int4 multi-query 3D: DFlash2's verify is
+    # an 8-row multi-query batch, and excluding max_seqlen_q > 1 from the
+    # split-KV path forces a ~20-CTA 2D serial walk of the whole KV per step
+    # (measured: 3.6 tok/s at 72.6k depth vs 29.0 with speculation off). The
+    # q=1 equivalence "tokens == num_seqs" is what the old num_seqs check
+    # silently relied on for scratch-buffer capacity; multi-query breaks that
+    # equivalence, so capacity is checked against the token-indexed scratch
+    # buffers directly. Opt-in via VLLM_INT4_MQ_3D=1 (promotion gates open).
+    _mq = max_seqlen_q > 1
+    _mq_3d_enabled = os.environ.get("VLLM_INT4_MQ_3D", "0") == "1"
+    _capacity_ok = (
+        softmax_segm_output is not None
+        and softmax_segm_max is not None
+        and softmax_segm_expsum is not None
+        and q.shape[0] <= softmax_segm_output.shape[0]
+        and q.shape[0] <= softmax_segm_max.shape[0]
+        and q.shape[0] <= softmax_segm_expsum.shape[0]
+    )
     use_3d = not (
         seq_threshold_3D is None
         or num_par_softmax_segments is None
         or softmax_segm_output is None
         or softmax_segm_max is None
         or softmax_segm_expsum is None
-        or max_seqlen_q > 1
+        or (_mq and not (_mq_3d_enabled and max_seqlen_q <= 16 and _capacity_ok))
         or num_seqs > seq_threshold_3D
         or is_batch_invariant
     )
+    if os.environ.get("VLLM_INT4_MQ_3D_DEBUG") == "1":
+        print(
+            f"[int4-mq3d] tokens={q.shape[0]} num_seqs={num_seqs} "
+            f"max_seqlen_q={max_seqlen_q} use_3d={use_3d} "
+            f"segments={num_par_softmax_segments if use_3d else 1}",
+            flush=True,
+        )
 
     # 3D never reads ``output_ptr`` and 2D never reads the segm tensors,
     # but Triton needs a non-null pointer everywhere; reuse ``out`` as
