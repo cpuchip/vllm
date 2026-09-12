@@ -1265,6 +1265,53 @@ def marlin_int4_fp8_preprocess(
     return torch.ops._C.marlin_int4_fp8_preprocess(qweight, qzeros_or_none, inplace)
 
 
+import os as _os
+
+_MARLIN_TUNE_ENABLED = _os.environ.get("VLLM_MARLIN_TUNE", "0") == "1"
+_MARLIN_TUNE_OP = None
+
+
+def _load_marlin_tune():
+    """RTX 3090 (sm86) tile table for the M<=16 decode/verify GEMMs: the same 0.27.1
+    marlin source built standalone (~/marlin-tune/src) with a (size_n, size_k,
+    num_bits, m_max) -> config table resolved inside marlin_mm, so CUDA graphs and
+    torch.compile see one op and no Python branches on size_m. Shapes without a
+    table row run the stock heuristics of the same source. VLLM_MARLIN_TUNE=1
+    turns it on; regenerate with bench_marlin.py --grid on an idle GPU."""
+    global _MARLIN_TUNE_OP
+    import marlin_best
+    import marlin_tune_ext
+
+    marlin_tune_ext.set_table(marlin_best.table())
+    try:
+        @register_fake("_C_marlin_tune::marlin_gemm")
+        def _marlin_tune_fake(a, c, b_q_weight, b_bias, b_scales, a_scales,
+                              global_scale, b_zeros, g_idx, perm, workspace,
+                              b_q_type_id, size_m, size_n, size_k,
+                              is_k_full=True, use_atomic_add=False,
+                              use_fp32_reduce=False, is_zp_float=False):
+            dtype = a.dtype
+            if dtype not in [torch.half, torch.bfloat16]:
+                dtype = b_scales.dtype  # int8/fp8 activations: out follows scales
+            return torch.empty((size_m, size_n), dtype=dtype, device=a.device)
+    except RuntimeError:
+        pass  # fake already registered
+    _MARLIN_TUNE_OP = torch.ops._C_marlin_tune.marlin_gemm
+    logger.info_once("marlin_gemm: routing through the sm86-tuned _C_marlin_tune "
+                     "build (%d table rows)", len(marlin_best.table()))
+
+
+if _MARLIN_TUNE_ENABLED:
+    # Load EAGERLY at import: set_table/import inside the hot wrapper lands inside
+    # dynamo tracing of the compiled model and graph-breaks the boot (gb0007).
+    try:
+        _load_marlin_tune()
+    except Exception:
+        logger.exception("VLLM_MARLIN_TUNE=1 but the tuned marlin build failed to "
+                         "load; continuing on stock marlin")
+        _MARLIN_TUNE_ENABLED = False
+
+
 def marlin_gemm(
     a: torch.Tensor,
     c: torch.Tensor | None,
@@ -1286,6 +1333,11 @@ def marlin_gemm(
     use_fp32_reduce: bool = False,
     is_zp_float: bool = False,
 ) -> torch.Tensor:
+    if _MARLIN_TUNE_OP is not None:
+        return _MARLIN_TUNE_OP(
+            a, c, b_q_weight, b_bias, b_scales, a_scales, global_scale, b_zeros,
+            g_idx, perm, workspace, b_q_type.id, size_m, size_n, size_k,
+            is_k_full, use_atomic_add, use_fp32_reduce, is_zp_float)
     return torch.ops._C.marlin_gemm(
         a,
         c,
