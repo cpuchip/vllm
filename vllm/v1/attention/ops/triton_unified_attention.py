@@ -715,6 +715,27 @@ def reduce_segments(
     # sequence len for this particular sequence
     seq_len = tl.load(seq_lens_ptr + seq_idx)
 
+    # syv-fork (fermion, 2026-08-27): zero-length (padded) rows. The producer
+    # early-returns without writing any segment for seq_len == 0, and
+    # cdiv(0, 0) below makes act_num_segments garbage, so the masked loads
+    # could read unwritten scratch (NaN-poisoning the output through the
+    # rescale path even past the expsum==0 guard). Write zeros and leave.
+    if seq_len == 0:
+        _z_dim_mask = tl.where(
+            tl.arange(0, HEAD_SIZE_PADDED) < HEAD_SIZE, 1, 0
+        ).to(tl.int1)
+        _z_offset = (
+            query_token_idx * output_stride_0
+            + query_head_idx * output_stride_1
+            + tl.arange(0, HEAD_SIZE_PADDED)
+        )
+        tl.store(
+            output_ptr + _z_offset,
+            tl.zeros([HEAD_SIZE_PADDED], dtype=output_ptr.dtype.element_ty),
+            mask=_z_dim_mask,
+        )
+        return
+
     # number of segments for this particular sequence
     num_segments = NUM_SEGMENTS_PER_SEQ
     tiles_per_segment = cdiv_fn(seq_len, num_segments * TILE_SIZE)
