@@ -966,7 +966,7 @@ def get_draft_quant_config(vllm_config: VllmConfig) -> "QuantizationConfig | Non
 
     return (
         VllmConfig.get_quantization_config(draft_model_config, draft_load_config)
-        if draft_model_config
+        if draft_model_config and getattr(draft_model_config.hf_config, "quantization_config", None) is not None
         else None
     )
 
