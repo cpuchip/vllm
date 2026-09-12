@@ -90,7 +90,8 @@ class KVCacheCoordinator(ABC):
         # The scheduling granularity (LCM of all group block sizes), must be a multiple
         # of the hash_block_size and the block size of each group.
         assert scheduler_block_size % hash_block_size == 0 and all(
-            scheduler_block_size % g.kv_cache_spec.block_size == 0
+            isinstance(g.kv_cache_spec, SlidingWindowSpec)
+            or scheduler_block_size % g.kv_cache_spec.block_size == 0
             for g in kv_cache_config.kv_cache_groups
         )
         self.scheduler_block_size = scheduler_block_size
@@ -607,7 +608,12 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
             if group.kv_cache_spec.prefix_cacheable
         ]
         assert all(
-            block_size % hash_block_size == 0 for block_size in group_block_sizes
+            isinstance(g.kv_cache_spec, SlidingWindowSpec)
+            or block_size % hash_block_size == 0
+            or hash_block_size % block_size == 0
+            for g, block_size in zip(
+                kv_cache_config.kv_cache_groups, group_block_sizes
+            )
         ), (
             "Each KV cache group's real block_size must be divisible by "
             f"hash_block_size. block_sizes={group_block_sizes}, "
