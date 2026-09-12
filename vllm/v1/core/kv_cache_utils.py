@@ -1360,6 +1360,133 @@ def _glm5_next_tensor_layout(
         tail_names,
         tail_page,
     )
+def _promote_indivisible_block_sizes(
+    kv_cache_spec: dict[str, KVCacheSpec], max_page_size: int
+) -> tuple[dict[str, KVCacheSpec], int]:
+    """(syv) Raise the block size of layers whose page does not divide the maximum.
+
+    ``unify_kv_cache_spec_page_size`` scales a small page up to the maximum by an
+    integer block-size ratio, and falls back to padding the *page* when the ratio is
+    not an integer. That fallback keeps the layer's block size, so a sliding-window
+    draft layer -- born at the backend's smallest kernel block, 16 -- pays a whole
+    primary page for every 16 tokens. On this repo's DFlash2 drafter that is a 53x
+    blow-up: 385 blocks of 1.71 MiB to hold 33 KB of useful KV, a constant 5.2 GiB.
+
+    It is invisible with a bf16 cache, where the target (4 KV heads x 256) and the
+    drafter (8 x 128) coincidentally both need 4096 B per token per layer, so the
+    ratio is the exact integer 28. A per-token-head quantized cache adds one fp32
+    scale *per head*, which breaks the coincidence (2080 vs 2112 B/token) -- and
+    2112 = 2**6 * 3 * 11 shares no useful factor with the primary page, so no block
+    size ever divides it.
+
+    Instead of padding such a layer's page, round its block size *up* to the smallest
+    multiple of its own kernel granularity whose natural page covers ``max_page_size``.
+    Its page then becomes the new maximum and every other layer pads up by a percent
+    or two -- which is what the padding branch is good at, and cheap, because those
+    layers hold hundreds of blocks each rather than 385 nearly-empty ones.
+
+    Only fires when every other spec can actually accept padding, so it never turns a
+    config that starts today into a NotImplementedError.
+    """
+    candidates = {
+        name: spec
+        for name, spec in kv_cache_spec.items()
+        if isinstance(spec, AttentionSpec)
+        and spec.page_size_bytes < max_page_size
+        and max_page_size % spec.page_size_bytes != 0
+        and spec.block_size > 0
+    }
+    if not candidates:
+        return kv_cache_spec, max_page_size
+
+    # (syv) The promoted block must also satisfy the scheduler's invariant: the
+    # scheduling granularity is the LCM of the primary groups' blocks, and every
+    # group's block has to divide it (kv_cache_coordinator's assert). Covering
+    # max_page_size does not give that for free -- at DFLASH_TOKENS=7 the drafter
+    # landed on 848 against a primary block of 1696 by luck. At 15 the mamba page
+    # grows with the spec-decode state, the primary block moves 1696 -> 1840, and
+    # 928 divides nothing the scheduler can use, so the engine died in an
+    # assert three layers down (#63). Round each promotion up to a *divisor* of
+    # the primary block; the primary layers then scale up by that integer ratio
+    # in unify, which is the branch they already take.
+    primary_blocks = {
+        spec.block_size
+        for name, spec in kv_cache_spec.items()
+        if isinstance(spec, AttentionSpec)
+        and name not in candidates
+        and spec.page_size_bytes == max_page_size
+    }
+    primary_block = next(iter(primary_blocks)) if len(primary_blocks) == 1 else None
+
+    new_max = max_page_size
+    promoted: dict[str, KVCacheSpec] = {}
+    for name, spec in candidates.items():
+        per_block = spec.page_size_bytes // spec.block_size  # bytes per token, this layer
+        if per_block <= 0:
+            return kv_cache_spec, max_page_size
+        ratio = cdiv(max_page_size, spec.page_size_bytes)
+        new_block_size = spec.block_size * ratio
+        if primary_block is not None and primary_block % new_block_size != 0:
+            divisor = next(
+                (
+                    d
+                    for d in range(new_block_size, primary_block + 1)
+                    if primary_block % d == 0
+                ),
+                None,
+            )
+            if divisor is None:
+                # Nothing between the covering block and the primary block
+                # divides it. Leave the config alone rather than break the
+                # scheduler: unify then pads this layer's page at block 16,
+                # which is expensive but boots.
+                logger.info(
+                    "Not promoting draft block sizes: no divisor of the primary "
+                    "block %d is >= layer %s's covering block %d.",
+                    primary_block,
+                    name,
+                    new_block_size,
+                )
+                return kv_cache_spec, max_page_size
+            new_block_size = divisor
+        new_spec = replace(spec, block_size=new_block_size)
+        if new_spec.page_size_bytes < max_page_size:
+            return kv_cache_spec, max_page_size
+        promoted[name] = new_spec
+        new_max = max(new_max, new_spec.page_size_bytes)
+
+    # Everything not promoted must be able to reach new_max: Mamba pads by
+    # construction, attention only if its backend reads pages by block stride.
+    for name, spec in kv_cache_spec.items():
+        if name in promoted or spec.page_size_bytes == new_max:
+            continue
+        if isinstance(spec, MambaSpec):
+            continue
+        if new_max % spec.page_size_bytes == 0:
+            continue
+        if isinstance(spec, AttentionSpec) and not isinstance(spec, MLAAttentionSpec):
+            continue
+        logger.info(
+            "Not promoting draft block sizes: layer %s can neither scale nor pad "
+            "to the resulting page size.",
+            name,
+        )
+        return kv_cache_spec, max_page_size
+
+    updated = dict(kv_cache_spec)
+    for name, spec in promoted.items():
+        logger.info(
+            "Raising block size of %s from %d to %d tokens so its page (%d B) covers "
+            "the maximum (%d B) instead of being padded to it at block %d.",
+            name,
+            kv_cache_spec[name].block_size,
+            spec.block_size,
+            spec.page_size_bytes,
+            max_page_size,
+            kv_cache_spec[name].block_size,
+        )
+        updated[name] = spec
+    return updated, new_max
 
 
 def unify_kv_cache_spec_page_size(
@@ -1392,6 +1519,12 @@ def unify_kv_cache_spec_page_size(
         return kv_cache_spec
 
     max_page_size = max(page_sizes)
+    # (syv) see _promote_indivisible_block_sizes: a draft layer whose page does not
+    # divide the maximum would otherwise keep its 16-token block and pad its page to
+    # the full maximum, costing a whole primary page per 16 tokens.
+    kv_cache_spec, max_page_size = _promote_indivisible_block_sizes(
+        kv_cache_spec, max_page_size
+    )
     new_kv_cache_spec = {}
     for layer_name, layer_spec in kv_cache_spec.items():
         if layer_spec.page_size_bytes == max_page_size:
