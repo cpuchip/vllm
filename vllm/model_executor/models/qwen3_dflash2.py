@@ -127,8 +127,15 @@ class DFlash2Qwen3DecoderLayer(DFlashQwen3DecoderLayer):
             hidden_size=config.hidden_size,
             taps=int(draft_config["conv_kernel_size"]),
             group_size=int(draft_config["conv_group_size"]),
-            # Query tokens per request: the bonus token plus the mask tokens.
-            block_size=1 + speculative_config.num_speculative_tokens,
+            # Query tokens per request: the bonus token plus the mask tokens. The drafter
+            # emits the block its checkpoint was trained for even when the target verifies a
+            # longer one (v1/worker/gpu/spec_decode/dflash2/lookup.py fills the rest from
+            # the context), and this convolution resets on the block boundary -- with the
+            # wrong size it runs across the boundary between two requests' blocks.
+            block_size=min(
+                1 + speculative_config.num_speculative_tokens,
+                int(draft_config.get("block_size", 1 << 30)),
+            ),
             params_dtype=vllm_config.model_config.dtype,
         )
         self.attention_conv = DFlashGroupedConv(

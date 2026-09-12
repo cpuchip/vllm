@@ -45,6 +45,7 @@ from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 from vllm.v1.worker.gpu.model_states.interface import ModelState
 from vllm.v1.worker.ubatch_utils import check_ubatch_thresholds, get_num_ubatches
 from vllm.v1.worker.utils import AttentionGroup, clear_layer_kv_caches
+import vllm.envs as envs
 
 if TYPE_CHECKING:
     from vllm.v1.worker.gpu.model_runner import GPUModelRunner
@@ -289,6 +290,31 @@ class CudaGraphManager:
             )
         else:
             decode_query_lens = [self.decode_query_len]
+            # A DFlash drafter whose checkpoint block is shorter than the verify block
+            # (v1/worker/gpu/spec_decode/dflash2/lookup.py fills the rest from the request's
+            # own context) schedules either length, so both need a decode graph. Without
+            # this the short step -- the one taken on ordinary prose -- runs piecewise.
+            if (
+                speculative_config is not None
+                and envs.VLLM_DFLASH2_GRAPH_BOTH
+                and envs.VLLM_DFLASH2_LOOKUP
+            ):
+                _cfg = getattr(
+                    getattr(speculative_config, "draft_model_config", None),
+                    "hf_config",
+                    None,
+                )
+                _block = int((getattr(_cfg, "dflash_config", None) or {}).get("block_size", 0))
+                _short = _block + (
+                    self.decode_query_len - self.vllm_config.num_speculative_tokens - 1
+                )
+                if 0 < _short < self.decode_query_len:
+                    decode_query_lens.append(_short)
+                    logger.info(
+                        "Capturing decode graphs for query lengths %s (the drafter's block "
+                        "and the full verify block).",
+                        decode_query_lens,
+                    )
 
         capture_varlen_decode = (
             separate_decode_routine and bool(decode_mode) and self.varlen_decode
