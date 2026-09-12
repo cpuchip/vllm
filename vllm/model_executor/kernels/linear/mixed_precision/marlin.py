@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 
+import os
+
 import torch
 
 from vllm import _custom_ops as ops
@@ -24,6 +26,55 @@ from vllm.model_executor.layers.quantization.utils.marlin_utils import (
 from vllm.model_executor.parameter import BasevLLMParameter, permute_param_layout_
 from vllm.platforms import current_platform
 from vllm.scalar_type import scalar_types
+
+# (syv) #27: sm80 (GA100) wedges with Xid 31 during Marlin repack -- not from
+# the repack kernel, but from VMM mapping churn under the per-layer transient
+# allocations around it (the contiguous copy and the pad), after which an
+# unrelated elementwise kernel write-faults asynchronously. ahnguyen17 verified
+# on a CMP 170HX that the same math staged through CPU is bit-exact and
+# Xid-free, which convicts the allocation pattern, not the arithmetic. This is
+# the GPU-resident version of that fix: pad/copy into ONE grow-only staging
+# buffer per device (layer shapes repeat, so it reallocates a handful of times
+# instead of alloc/freeing two transients per layer), hand the SAME values to
+# the repack kernel, get bit-identical output. Costs one max-layer-sized buffer
+# (~141 MB on this stack) that stays resident after load on the cards where it
+# is on -- the card class where the alternative is a wedge-until-reboot.
+# Default: on for compute capability 8.0 exactly, off elsewhere; override with
+# VLLM_MARLIN_REPACK_STAGED=0/1.
+_REPACK_STAGING: dict = {}
+
+
+def _use_staged_repack(device: torch.device) -> bool:
+    env = os.environ.get("VLLM_MARLIN_REPACK_STAGED")
+    if env is not None:
+        return env == "1"
+    if device.type != "cuda":
+        return False
+    return torch.cuda.get_device_capability(device) == (8, 0)
+
+
+def _staged_pad_qweight(
+    qweight: torch.Tensor, size_n: int, size_k: int, padded_n: int, padded_k: int
+) -> torch.Tensor:
+    """marlin_pad_qweight + .contiguous() through a persistent staging buffer.
+
+    Returns a view holding exactly what the unstaged path would pass to
+    gptq_marlin_repack; the caller must consume it before the next call.
+    """
+    pack_factor = size_k // qweight.size(0)
+    rows, cols = padded_k // pack_factor, padded_n
+    need = rows * cols
+    buf = _REPACK_STAGING.get(qweight.device)
+    if buf is None or buf.numel() < need or buf.dtype != qweight.dtype:
+        _REPACK_STAGING.pop(qweight.device, None)
+        buf = torch.empty(need, dtype=qweight.dtype, device=qweight.device)
+        _REPACK_STAGING[qweight.device] = buf
+    view = buf[:need].view(rows, cols)
+    if (rows, cols) != (qweight.size(0), qweight.size(1)):
+        view.zero_()
+    view[: qweight.size(0), : qweight.size(1)].copy_(qweight)
+    return view
+
 
 from .MPLinearKernel import MPLinearKernel, MPLinearLayerConfig
 
@@ -136,6 +187,23 @@ class MarlinLinearKernel(MPLinearKernel):
         def transform_w_q(x):
             assert isinstance(x, BasevLLMParameter)
             permute_param_layout_(x, input_dim=0, output_dim=1, packed_dim=0)
+            if _use_staged_repack(x.data.device):
+                # (syv) #27: stage contiguous+pad through the persistent buffer
+                # and drop the source before the repack output allocates, so
+                # the only per-layer allocation left is the final weight.
+                staged = _staged_pad_qweight(
+                    x.data, size_n, size_k, padded_n, padded_k
+                )
+                x.data = torch.empty(0, dtype=staged.dtype, device=staged.device)
+                x.data = ops.gptq_marlin_repack(
+                    staged,
+                    perm=layer.g_idx_sort_indices,
+                    size_k=padded_k,
+                    size_n=padded_n,
+                    num_bits=c.weight_type.size_bits,
+                    is_a_8bit=is_a_8bit,
+                )
+                return x
             x.data = ops.gptq_marlin_repack(
                 marlin_pad_qweight(
                     x.data.contiguous(), size_n, size_k, padded_n, padded_k
