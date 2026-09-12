@@ -10,6 +10,7 @@ import sys
 import time
 from typing import TYPE_CHECKING
 
+import numpy as np
 import torch
 
 import vllm.envs as envs
@@ -96,6 +97,63 @@ def _warmup_ll_bf16_router_gemm(model: torch.nn.Module) -> None:
     )
 
 
+def rejection_sampler_warmup(worker: "Worker") -> None:
+    """Compile the rejection sampler's Triton kernels before serving.
+
+    The profile-time dummy sampler run exercises only the plain sampler
+    (num_draft_tokens == 0), so with speculative decoding the rejection-sampler
+    kernels (_compute_local_logits_stats / _rejection / _resample) first compile
+    inside the first real request that verifies drafts -- a few hundred ms that
+    jit_monitor reports as "JIT compilation during inference". Run one
+    spec-shaped dummy verify here: k+1 logits per request, the speculator's own
+    draft_logits buffer (so HAS_DRAFT_LOGITS matches serving), and a draft token
+    the all-zero logits cannot accept, so the resample path compiles too.
+    """
+    mr = worker.model_runner
+    rs = getattr(mr, "rejection_sampler", None)
+    sp = getattr(mr, "speculator", None)
+    if rs is None or sp is None or not getattr(worker, "use_v2_model_runner", False):
+        return
+    import dataclasses
+
+    from vllm.v1.worker.gpu.input_batch import InputBatch
+
+    k = int(mr.num_speculative_steps)
+    num_reqs = 1
+    n = num_reqs * (k + 1)
+    device = mr.device
+    with torch.inference_mode():
+        batch = InputBatch.make_dummy(num_reqs, n, mr.input_buffers)
+        cu_np = np.arange(num_reqs + 1, dtype=np.int32) * (k + 1)
+        batch = dataclasses.replace(
+            batch,
+            num_draft_tokens=num_reqs * k,
+            num_draft_tokens_per_req=np.full(num_reqs, k, dtype=np.int32),
+            logits_indices=torch.arange(n, dtype=torch.int32, device=device),
+            cu_num_logits=torch.from_numpy(cu_np).to(device),
+            cu_num_logits_np=cu_np,
+            expanded_idx_mapping=batch.idx_mapping.repeat_interleave(k + 1),
+            expanded_local_pos=torch.arange(
+                k + 1, dtype=torch.int32, device=device
+            ).repeat(num_reqs),
+        )
+        batch.input_ids[:n].fill_(1)
+        hidden = torch.zeros(
+            n,
+            mr.model_config.get_hidden_size(),
+            dtype=mr.model_config.dtype,
+            device=device,
+        )
+        logits = mr.model.compute_logits(hidden)
+        rs(logits, batch, sp.draft_logits)
+    torch.cuda.synchronize()
+    logger.info(
+        "Warmed rejection-sampler kernels (k=%d, draft_logits=%s)",
+        k,
+        sp.draft_logits is not None,
+    )
+
+
 def _warmup_kimi_k3_gemm_rs_ar() -> None:
     # Kimi-K3 model construction imports this module only when GEMM-RS/AR is
     # enabled and initializes its singleton before kernel_warmup runs. Avoid
@@ -140,6 +198,10 @@ def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
 
     compilation_config = worker.vllm_config.compilation_config
     cudagraph_capture_sizes = list(compilation_config.cudagraph_capture_sizes or [])
+
+    # Spec-decode verify kernels: never reached by the prefill-shaped
+    # profiling run; without this they JIT inside the first real request.
+    rejection_sampler_warmup(worker)
 
     # DSv4 mHC TileLang kernels (hc_pre/hc_post/hc_head_op) run every decoder
     # layer per token; warm them across token sizes first so the first real
