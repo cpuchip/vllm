@@ -937,6 +937,11 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
         assert dcp_world_size == 1, "DCP not support sliding window attn now."
         assert pcp_world_size == 1, "PCP not support sliding window attn now."
         # Fine-grained partial hits are not supported for sliding window now
+        if (
+            kv_cache_spec.block_size % block_pool.hash_block_size != 0
+            or alignment_tokens % kv_cache_spec.block_size != 0
+        ):
+            return tuple([] for _ in kv_cache_group_ids), 0
         assert alignment_tokens % kv_cache_spec.block_size == 0, (
             "SlidingWindowManager does not support fine-grained (partial) cache hits"
         )
@@ -1124,6 +1129,24 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
         window in the future.
         """
         return 0
+
+    def cache_blocks(
+        self,
+        request: Request,
+        num_tokens: int,
+        retention_interval: int | None = None,
+    ) -> None:
+        # Prefix reuse is not meaningful for a rolling window. Skip the write
+        # path when the SW block and hash unit are not divisible in either
+        # direction, or when the scheduler boundary is finer than the SW
+        # block. The latter would make reachable_block_mask assert before
+        # resolve_block_hashes is reached.
+        if (
+            self.block_size % self.block_pool.hash_block_size != 0
+            or self.scheduler_block_size % self.block_size != 0
+        ):
+            return
+        super().cache_blocks(request, num_tokens, retention_interval=retention_interval)
 
 
 class CircularBufferManager(FullAttentionManager):
