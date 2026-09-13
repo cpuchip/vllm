@@ -240,7 +240,19 @@ class SchedulerOffloadConfig(NamedTuple):
                     if isinstance(g.kv_cache_spec, SlidingWindowSpec)
                 }
         if use_eagle and not eagle_groups:
-            eagle_groups = set(range(len(kv_cache_config.kv_cache_groups)))
+            # (syv, from upstream #52771) No group is annotated as holding drafter
+            # layers: shared-group MTP (the Qwen3.5-style drafter is a decoder layer
+            # merged into the target's full-attention group). Marking EVERY group as a
+            # drafter made the volatile-tail pop apply to all groups, which zeroes the
+            # whole request's offload hit whenever any group's servable window is a
+            # single chunk (upstream #52735): the tier stored but never served. A
+            # drafter chunk served one step stale can only lower acceptance; the
+            # target verifies every draft. Fail toward serving.
+            logger.info_once(
+                "KV offloading: speculative decoding is enabled but no KV-cache "
+                "group is annotated as a drafter group; treating all groups as "
+                "non-draft for offloading."
+            )
 
         if eagle_groups:
             logger.info(
@@ -442,7 +454,9 @@ class RequestOffloadState:
         """
         num_chunks = num_offloadable_tokens // group_config.tokens_per_chunk
         is_decoding = num_offloadable_tokens > self.req.num_prompt_tokens
-        if group_config.is_eagle_group and is_decoding:
+        # Finished requests have no pending speculation, so the final chunk is stable
+        # and storable (upstream #52771).
+        if group_config.is_eagle_group and is_decoding and not self.req.is_finished():
             num_chunks = max(0, num_chunks - 1)
         num_allocated_chunks = (
             len(group_state.block_ids) // self.config.blocks_per_chunk
@@ -799,9 +813,12 @@ class OffloadingConnectorScheduler:
                 )
 
                 # For eagle groups, query one extra chunk that will be popped.
-                # We only need to increase the query size for sliding window groups.
+                # Widening applies to every group type (upstream #52771): without it
+                # the pop below shrinks max_hit_size_tokens past what was queried,
+                # which can push the confirmed boundary under a coarser sibling
+                # group's chunk granularity and zero the whole request's hit.
                 query_max = max_hit_size_tokens
-                if is_eagle_unverified and sliding_window_size_in_chunks is not None:
+                if is_eagle_unverified:
                     query_max = min(
                         max_hit_size_tokens + tokens_per_chunk,
                         len(offload_keys) * tokens_per_chunk,
@@ -1066,18 +1083,20 @@ class OffloadingConnectorScheduler:
             num_gpu_blocks = cdiv(num_cached_tokens, tokens_per_block)
 
             assert len(group_blocks) >= num_gpu_blocks
-            num_locally_computed_gpu_blocks = num_gpu_blocks
-            # Skip null placeholder blocks (used for sliding window or mamba padding).
-            for i, block in enumerate(group_blocks[:num_gpu_blocks]):
+            # ``load_start_gpu_block_idx``: the index in ``group_blocks`` where the
+            # load region begins, a slice bound, not a count of computed blocks.
+            # Scan from the computed boundary, not 0: sparse groups (Mamba, SWA)
+            # legitimately hold non-null unhashed blocks below it (upstream #52807).
+            first_fresh_gpu_block_idx = cdiv(num_locally_computed_tokens, tokens_per_block)
+            load_start_gpu_block_idx = num_gpu_blocks
+            for i in range(first_fresh_gpu_block_idx, num_gpu_blocks):
+                block = group_blocks[i]
                 if not block.is_null and block.block_hash is None:
-                    num_locally_computed_gpu_blocks = i
+                    load_start_gpu_block_idx = i
                     break
 
-            assert (
-                num_locally_computed_tokens
-                <= num_locally_computed_gpu_blocks * tokens_per_block
-            )
-            num_pending_gpu_blocks = num_gpu_blocks - num_locally_computed_gpu_blocks
+            assert num_locally_computed_tokens % tokens_per_block == 0
+            num_pending_gpu_blocks = num_gpu_blocks - load_start_gpu_block_idx
 
             if group_config.sliding_window_size_in_chunks is not None:
                 assert (
@@ -1090,7 +1109,7 @@ class OffloadingConnectorScheduler:
             num_chunks = cdiv(num_cached_tokens, tokens_per_chunk)
             if num_pending_gpu_blocks:
                 start_chunk_idx = (
-                    num_locally_computed_gpu_blocks // self.config.blocks_per_chunk
+                    load_start_gpu_block_idx // self.config.blocks_per_chunk
                 )
                 end_chunk_idx = num_chunks - (partial_tail_boundary is not None)
                 assert len(offload_keys) >= end_chunk_idx
@@ -1104,12 +1123,10 @@ class OffloadingConnectorScheduler:
 
             dst_block_ids.extend(
                 block.block_id
-                for block in group_blocks[
-                    num_locally_computed_gpu_blocks:num_gpu_blocks
-                ]
+                for block in group_blocks[load_start_gpu_block_idx:num_gpu_blocks]
             )
             group_sizes.append(num_pending_gpu_blocks)
-            block_indices.append(num_locally_computed_gpu_blocks)
+            block_indices.append(load_start_gpu_block_idx)
 
             # Skip prefix-hit chunks for block-level policy; for
             # request-level, next_stored_chunk_idx stays at 0 so all
@@ -1379,7 +1396,10 @@ class OffloadingConnectorScheduler:
             if req.status is RequestStatus.FINISHED_ABORTED:
                 num_tokens_after_batch = req.num_computed_tokens
             elif req.is_finished():
-                num_tokens_after_batch = req.num_tokens
+                # Clamp to the GPU prefix cache commit point: the final sampled token
+                # has no KV of its own (under spec decode its slot holds a rejected
+                # draft), so a block ending there must not be stored (vllm #54288).
+                num_tokens_after_batch = max(req.num_prompt_tokens, req.num_tokens - 1)
             else:
                 num_scheduled_tokens = scheduler_output.num_scheduled_tokens[req_id]
                 num_tokens_after_batch = req.num_computed_tokens + num_scheduled_tokens
