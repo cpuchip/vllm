@@ -1205,6 +1205,8 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
         request: Request,
         num_tokens: int,
         retention_interval: int | None = None,
+        *,
+        replay_boundaries: Sequence[int],
     ) -> None:
         # Prefix reuse is not meaningful for a rolling window. Skip the write
         # path when the SW block and hash unit are not divisible in either
@@ -1216,7 +1218,12 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
             or self.scheduler_block_size % self.block_size != 0
         ):
             return
-        super().cache_blocks(request, num_tokens, retention_interval=retention_interval)
+        super().cache_blocks(
+            request,
+            num_tokens,
+            retention_interval=retention_interval,
+            replay_boundaries=replay_boundaries,
+        )
 
 
 class CircularBufferManager(FullAttentionManager):
