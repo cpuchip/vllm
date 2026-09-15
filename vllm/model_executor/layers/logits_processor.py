@@ -20,6 +20,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     UnquantizedEmbeddingMethod,
     VocabParallelEmbedding,
 )
+import vllm.envs as envs
 from vllm.platforms import current_platform
 from vllm.utils.flashinfer import has_flashinfer
 
@@ -34,6 +35,16 @@ def _flashinfer_topk() -> Callable[..., tuple[torch.Tensor, torch.Tensor]] | Non
     torch.topk.
     """
     if not current_platform.is_cuda():
+        return None
+    if not envs.VLLM_USE_FLASHINFER_SAMPLER:
+        # The same switch that gates the sampler's FlashInfer path. Without this the
+        # switch is only half a kill-switch: the drafter's candidate top-k still enters
+        # FlashInfer, and on a box whose nvcc predates --compress-mode the 0.6.18 JIT
+        # fails there and takes the boot with it (syv-ai #106, SPEC=dflash2 only).
+        logger.info_once(
+            "VLLM_USE_FLASHINFER_SAMPLER=0; vocab-parallel top-k uses torch.topk, "
+            "at roughly half the speed."
+        )
         return None
     if not has_flashinfer():
         logger.info_once(
