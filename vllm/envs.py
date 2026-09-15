@@ -216,6 +216,8 @@ if TYPE_CHECKING:
     VLLM_DFLASH2_CHAIN_LOG_SEC: float = 30.0
     VLLM_DFLASH2_CHAIN_GREEDY_ONLY: bool = True
     VLLM_SPEC_ATTN_BLOCK_M: int = 0
+    # syv patch: split-KV verify debug print (patches/triton-spec-attn-fp8-kv.patch)
+    VLLM_SPEC_ATTN_DEBUG: bool = False
     VLLM_INT4_MQ_3D: bool = False
     VLLM_INT4_MQ_3D_DEBUG: bool = False
     VLLM_MAMBA_ALIGN_KEEP_CHECKPOINTS: bool = False
@@ -1604,6 +1606,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_DFLASH2_CHAIN_GREEDY_ONLY": lambda: os.environ.get("VLLM_DFLASH2_CHAIN_GREEDY_ONLY", "1") == "1",
     # split-KV verify kernel: force the query-row tile (0 = pick by row count)
     "VLLM_SPEC_ATTN_BLOCK_M": lambda: int(os.environ.get("VLLM_SPEC_ATTN_BLOCK_M", "0")),
+    # split-KV verify kernel: debug print
+    "VLLM_SPEC_ATTN_DEBUG": lambda: os.environ.get("VLLM_SPEC_ATTN_DEBUG", "0") == "1",
     # int4 per-token-head KV: the multi-query 3D verify path and its debug print
     "VLLM_INT4_MQ_3D": lambda: os.environ.get("VLLM_INT4_MQ_3D", "0") == "1",
     "VLLM_INT4_MQ_3D_DEBUG": lambda: os.environ.get("VLLM_INT4_MQ_3D_DEBUG", "0") == "1",
