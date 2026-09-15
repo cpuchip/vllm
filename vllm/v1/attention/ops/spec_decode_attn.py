@@ -57,7 +57,7 @@ QMAX_TOKENS = 64   # query tokens per request the caller may ask for
 def _spec_attn_partial(
     q_ptr, k_ptr, v_ptr, bt_ptr, seqused_ptr, cu_q_ptr,
     part_o_ptr, part_m_ptr, part_l_ptr,
-    ks_ptr, vs_ptr,
+    ks_ptr, vs_ptr, kd_ptr, vd_ptr, qd_ptr,
     scale,
     stride_qt, stride_qh,
     stride_kb, stride_ks, stride_kh,
@@ -67,7 +67,7 @@ def _spec_attn_partial(
     stride_vsb, stride_vss, stride_vsh,
     G: tl.constexpr, Hq: tl.constexpr, QMAX: tl.constexpr, D: tl.constexpr, BLOCK_SIZE: tl.constexpr,
     BLOCK_M: tl.constexpr, TILE: tl.constexpr, NSEG: tl.constexpr, QT: tl.constexpr,
-    NTILE: tl.constexpr, QUANT: tl.constexpr,
+    NTILE: tl.constexpr, QUANT: tl.constexpr, FP8: tl.constexpr, Q_FP8: tl.constexpr,
 ):
     pid = tl.program_id(0)
     req = pid // NTILE
@@ -88,6 +88,9 @@ def _spec_attn_partial(
     d = tl.arange(0, D)
     q_ptrs = q_ptr + (q_start + ri)[:, None] * stride_qt + (kvh * G + rg)[:, None] * stride_qh + d[None, :]
     q = tl.load(q_ptrs, mask=row_ok[:, None], other=0.0)
+    if Q_FP8:
+        # the fp8 cache path quantizes the query too (layer._q_scale); undo it once here
+        q = q.to(tl.float32) * tl.load(qd_ptr)
 
     # this segment's key range
     tiles_total = (kv_len + TILE - 1) // TILE
@@ -99,6 +102,12 @@ def _spec_attn_partial(
     l_i = tl.zeros([BLOCK_M], tl.float32)
     acc = tl.zeros([BLOCK_M, D], tl.float32)
     qs = (q * scale).to(tl.bfloat16)
+    if FP8:
+        # fp8 e4m3 data with one f32 scale per layer tensor (vLLM's `fp8` cache): fp8 -> bf16 is exact
+        # (3 mantissa bits into 8), and the scalar scales fold in after each dot, the way the int8
+        # per-token scales do, so the only new rounding is the bf16 dot itself.
+        k_dsc = tl.load(kd_ptr)
+        v_dsc = tl.load(vd_ptr)
 
     for t in range(t0, t1):
         pos = t * TILE + tl.arange(0, TILE)
@@ -121,6 +130,10 @@ def _spec_attn_partial(
             v_sc = tl.load(vs_ptr + blk * stride_vsb + slot * stride_vss + kvh * stride_vsh,
                            mask=k_ok, other=0.0)
             s = tl.dot(qs, tl.trans(k)).to(tl.float32) * k_sc[None, :]
+        elif FP8:
+            k = k.to(tl.bfloat16)
+            v = v.to(tl.bfloat16)
+            s = tl.dot(qs, tl.trans(k)).to(tl.float32) * k_dsc
         else:
             s = tl.dot(qs, tl.trans(k)).to(tl.float32)            # [BLOCK_M, TILE]
         allowed = k_ok[None, :] & (pos[None, :] <= q_pos[:, None]) & row_ok[:, None]
@@ -132,6 +145,8 @@ def _spec_attn_partial(
         l_i = l_i * alpha + tl.sum(p, 1)
         if QUANT:
             acc = acc * alpha[:, None] + tl.dot((p * v_sc[None, :]).to(tl.bfloat16), v).to(tl.float32)
+        elif FP8:
+            acc = acc * alpha[:, None] + tl.dot(p.to(tl.bfloat16), v).to(tl.float32) * v_dsc
         else:
             acc = acc * alpha[:, None] + tl.dot(p.to(tl.bfloat16), v).to(tl.float32)
         m_i = m_new
@@ -208,23 +223,43 @@ class SpecDecodeAttention:
         return block_m, qt, triton.cdiv(q_len, qt), 8 if block_m >= 128 else 4
 
     def run(self, q, key_cache, value_cache, out, cu_seqlens_q, seqused_k, block_table, scale,
-            num_reqs, max_query_len, k_scale_cache=None, v_scale_cache=None):
+            num_reqs, max_query_len, k_scale_cache=None, v_scale_cache=None,
+            k_descale=None, v_descale=None, q_descale=None):
         """key/value_cache: [num_blocks, block_size, Hkv, D] bf16, or [.., D + pad] int8
-        with k/v_scale_cache [num_blocks, block_size, Hkv] float32 (per-token-head int8)."""
+        with k/v_scale_cache [num_blocks, block_size, Hkv] float32 (per-token-head int8), or
+        [.., D] fp8 e4m3 with k/v_descale one-element float32 tensors (vLLM's per-tensor `fp8`)."""
         Hq, D = q.shape[1], q.shape[2]
         Hkv = key_cache.shape[2]
         G = Hq // Hkv
         quant = k_scale_cache is not None
+        fp8 = key_cache.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+        q_fp8 = q.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+        if fp8:
+            assert not quant and k_descale is not None and v_descale is not None, "fp8 cache needs per-tensor descales"
+        if q_fp8:
+            assert q_descale is not None, "fp8 query needs its descale"
         assert max_query_len <= self.qmax, "too many query tokens per request for this kernel"
         assert num_reqs <= self.max_num_reqs
         # shared memory on sm86 is 99 KB: q tile + one K and one V tile + scores must fit
         block_m, qt, ntile, warps = self._plan(max_query_len, G, D)
         tile = 64 if (block_m <= 32 or D <= 128) else 32
+        if envs.VLLM_SPEC_ATTN_DEBUG:
+            self._dbg_calls = getattr(self, "_dbg_calls", 0) + 1
+            if self._dbg_calls in (1, 2, 500, 2000):
+                import time as _t
+                torch.cuda.synchronize(); _t0 = _t.perf_counter()
+                print(f"syv spec-attn run#{self._dbg_calls}: q {q.dtype} {tuple(q.shape)} strides {q.stride()} contig={q.is_contiguous()} | "
+                      f"kc {key_cache.dtype} {tuple(key_cache.shape)} strides {key_cache.stride()} | out {out.dtype} strides {out.stride()} | "
+                      f"quant={quant} fp8={fp8} q_fp8={q_fp8} kd={None if k_descale is None else float(k_descale.reshape(-1)[0])} "
+                      f"vd={None if v_descale is None else float(v_descale.reshape(-1)[0])} qd={None if q_descale is None else float(q_descale.reshape(-1)[0])} | "
+                      f"num_reqs={num_reqs} qlen={max_query_len} plan block_m={block_m} qt={qt} ntile={ntile} warps={warps} tile={tile} nseg={self.nseg} "
+                      f"seqused={seqused_k[:num_reqs].tolist()}", flush=True)
+                self._dbg_t0 = _t0
         grid = (num_reqs * ntile, Hkv, self.nseg)
         _spec_attn_partial[grid](
             q, key_cache, value_cache, block_table, seqused_k, cu_seqlens_q,
             self.part_o, self.part_m, self.part_l,
-            k_scale_cache, v_scale_cache,
+            k_scale_cache, v_scale_cache, k_descale, v_descale, q_descale,
             scale,
             q.stride(0), q.stride(1),
             key_cache.stride(0), key_cache.stride(1), key_cache.stride(2),
@@ -233,7 +268,7 @@ class SpecDecodeAttention:
             *(k_scale_cache.stride() if quant else (0, 0, 0)),
             *(v_scale_cache.stride() if quant else (0, 0, 0)),
             G=G, Hq=Hq, QMAX=self.qmax, D=D, BLOCK_SIZE=key_cache.shape[1], BLOCK_M=block_m,
-            TILE=tile, NSEG=self.nseg, QT=qt, NTILE=ntile, QUANT=quant,
+            TILE=tile, NSEG=self.nseg, QT=qt, NTILE=ntile, QUANT=quant, FP8=fp8, Q_FP8=q_fp8,
             num_warps=warps, num_stages=1,
         )
         _spec_attn_combine[(num_reqs, Hq, max_query_len)](
@@ -241,4 +276,8 @@ class SpecDecodeAttention:
             out.stride(0), out.stride(1),
             Hq=Hq, QMAX=self.qmax, D=D, NSEG=self.nseg, num_warps=4,
         )
+        if envs.VLLM_SPEC_ATTN_DEBUG and getattr(self, "_dbg_t0", None) is not None:
+            import time as _t
+            torch.cuda.synchronize(); print(f"syv spec-attn run#{self._dbg_calls}: kernel pair took {(_t.perf_counter() - self._dbg_t0) * 1e6:.0f} us", flush=True)
+            self._dbg_t0 = None
         return out

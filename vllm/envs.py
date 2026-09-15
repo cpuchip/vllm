@@ -182,6 +182,8 @@ if TYPE_CHECKING:
     VLLM_SPEC_DECODE_ATTN: bool = False
     VLLM_SPEC_DECODE_ATTN_QMAX: int = 0
     VLLM_SPEC_ATTN_BLOCK_M: int = 0
+    # syv patch: split-KV verify debug print (patches/triton-spec-attn-fp8-kv.patch)
+    VLLM_SPEC_ATTN_DEBUG: bool = False
     VLLM_RANDOMIZE_DP_DUMMY_INPUTS: bool = False
     VLLM_RAY_DP_PACK_STRATEGY: Literal["strict", "fill", "span"] = "strict"
     VLLM_RAY_DP_PLACEMENT_NODE_IPS: str = ""
@@ -1512,6 +1514,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SPEC_DECODE_ATTN": lambda: os.environ.get("VLLM_SPEC_DECODE_ATTN", "0") == "1",
     "VLLM_SPEC_DECODE_ATTN_QMAX": lambda: int(os.environ.get("VLLM_SPEC_DECODE_ATTN_QMAX", "0")),
     "VLLM_SPEC_ATTN_BLOCK_M": lambda: int(os.environ.get("VLLM_SPEC_ATTN_BLOCK_M", "0")),
+    # split-KV verify kernel: debug print
+    "VLLM_SPEC_ATTN_DEBUG": lambda: os.environ.get("VLLM_SPEC_ATTN_DEBUG", "0") == "1",
     # Randomize inputs during dummy runs when using Data Parallel
     "VLLM_RANDOMIZE_DP_DUMMY_INPUTS": lambda: (
         os.environ.get("VLLM_RANDOMIZE_DP_DUMMY_INPUTS", "0") == "1"
