@@ -44,6 +44,7 @@ from vllm.v1.attention.backends.flash_attn import (  # syv patch
     _spec_attn_enabled,
     _spec_attn_qmax,
     _spec_attn_run,
+    _spec_attn_run_fp8,
 )
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
@@ -857,10 +858,31 @@ class TritonAttentionImpl(AttentionImpl):
         # int8 per-token-head only: the kernel folds the per-(token, head) scales in after
         # each dot, which is exact because they are constant along the head dim. The
         # drafter's own sliding-window layers are excluded by the window test below.
+        # fp8 per-tensor (vLLM's `fp8` cache, sm89+): the same kernel reads fp8 e4m3 and folds the
+        # layer's scalar k/v scales in after each dot; it is what keeps FULL graphs and the split
+        # verify together on the 4090 (issue 87: stock Triton verify decays 2.3x by 90K).
+        spec_fp8 = (
+            self._kv_quant_mode == KVQuantMode.FP8_PER_TENSOR
+            and key_cache.dtype == self.fp8_dtype
+        )
+        if envs.VLLM_SPEC_ATTN_DEBUG and max_seqlen_q > 1 and not getattr(self, "_spec_dbg_logged", False):
+            self._spec_dbg_logged = True
+            logger.info(
+                "syv spec-attn gate: enabled=%s quant_mode=%s cache_dtype=%s fp8_dtype=%s q_descale=%s spec_fp8=%s "
+                "max_seqlen_q=%d qmax=%d causal=%s window=%s softcap=%s alibi=%s sinks=%s lookback=%s mm_prefix=%s rswa=%s out_scale=%s",
+                _spec_attn_enabled(), self._kv_quant_mode, key_cache.dtype, self.fp8_dtype, q_descale is not None, spec_fp8,
+                max_seqlen_q, _spec_attn_qmax(self.num_heads // self.num_kv_heads), attn_metadata.causal, self.sliding_window,
+                self.logits_soft_cap, self.alibi_slopes is not None, self.sinks is not None, self.chunk_lookback,
+                mm_prefix_range_tensor is not None, attn_metadata.rswa_prefix_lens is not None, output_scale is not None)
         if (
             _spec_attn_enabled()
-            and self._kv_quant_mode == KVQuantMode.INT8_PER_TOKEN_HEAD
-            and k_scale_cache is not None
+            and (
+                spec_fp8
+                or (
+                    k_scale_cache is not None
+                    and self._kv_quant_mode == KVQuantMode.INT8_PER_TOKEN_HEAD
+                )
+            )
             and 1 < max_seqlen_q <= _spec_attn_qmax(self.num_heads // self.num_kv_heads)
             and attn_metadata.causal
             and (self.sliding_window is None or self.sliding_window == (-1, -1))
@@ -872,6 +894,25 @@ class TritonAttentionImpl(AttentionImpl):
             and attn_metadata.rswa_prefix_lens is None
             and output_scale is None
         ):
+            if spec_fp8 and not getattr(self, "_spec_fp8_logged", False):
+                self._spec_fp8_logged = True
+                logger.info("syv spec-attn: split-KV verify on the fp8 per-tensor cache engaged (max_seqlen_q=%d)", max_seqlen_q)
+            if spec_fp8:
+                _spec_attn_run_fp8(
+                    self,
+                    query[:num_actual_tokens],
+                    key_cache,
+                    value_cache,
+                    output[:num_actual_tokens],
+                    cu_seqlens_q,
+                    seqused_k,
+                    block_table,
+                    max_seqlen_q,
+                    layer._k_scale,
+                    layer._v_scale,
+                    q_descale=q_descale,
+                )
+                return output
             _spec_attn_run(
                 self,
                 query[:num_actual_tokens],
