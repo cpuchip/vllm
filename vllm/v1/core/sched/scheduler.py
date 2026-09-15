@@ -2122,6 +2122,20 @@ class Scheduler(SchedulerInterface):
                 finished = self._handle_stopped_request(request)
                 if finished:
                     kv_transfer_params, ec_transfer_params = self._free_request(request)
+                    # 0.28.0 logged zero request-completion lines (1473 "Added"
+                    # lines vs 0 finish lines in 21.5 h of serving on a single
+                    # 3090), which made a completed request, a silently dropped
+                    # one, and a wedged one indistinguishable in the log. Emit
+                    # one line per request that leaves the scheduler finished.
+                    logger.info(
+                        "Request finished: req %s finish_reason=%s "
+                        "prompt_tokens=%d generated_tokens=%d elapsed_s=%.2f",
+                        request.request_id,
+                        getattr(finish_reason, "type", finish_reason),
+                        request.num_prompt_tokens,
+                        len(request.output_token_ids),
+                        max(0.0, time.time() - request.arrival_time),
+                    )
 
                 if status_before_stop == RequestStatus.RUNNING:
                     stopped_running_reqs.add(request)
