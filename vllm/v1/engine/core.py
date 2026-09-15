@@ -102,6 +102,68 @@ HANDSHAKE_TIMEOUT_MINS = 5
 _R = TypeVar("_R")  # Return type for collective_rpc
 
 
+class _StallSentinel:
+    """Detects the "engine core stopped stepping while requests are live"
+    failure class, and logs one warning line per stall episode.
+
+    The sentinel reads the scheduler's request counts itself on every tick
+    rather than from a snapshot the main loop refreshes, so a core that stops
+    stepping with a stale snapshot (e.g. a request parked
+    WAITING_FOR_REMOTE_KVS while the loop falls through to the input queue)
+    is still reported against its current state. `_last_done` is a plain
+    float written only by the main loop; a lock here could participate in
+    exactly the cross-thread stall this class exists to report. The thread is
+    a daemon; it dies with the EngineCore process.
+    """
+
+    def __init__(
+        self,
+        get_counts,
+        threshold_s: float,
+        check_interval_s: float = 5.0,
+    ):
+        self._get_counts = get_counts
+        self._threshold_s = threshold_s
+        self._check_interval_s = check_interval_s
+        self._last_done = time.monotonic()
+        self._stall_logged = False
+        self._stop = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run, name="EngineCoreStallSentinel", daemon=True
+        )
+        self._thread.start()
+
+    def step_done(self) -> None:
+        # A step completed: refresh the clock.
+        self._last_done = time.monotonic()
+        self._stall_logged = False
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def _run(self) -> None:
+        while not self._stop.wait(self._check_interval_s):
+            gap = time.monotonic() - self._last_done
+            if gap < self._threshold_s or self._stall_logged:
+                continue
+            try:
+                running, waiting = self._get_counts()
+            except Exception:  # noqa: BLE001 - never kill the sentinel
+                continue
+            if (running + waiting) > 0:
+                self._stall_logged = True
+                logger.warning(
+                    "EngineCore stall: no completed step for %.0f s "
+                    "(threshold %.0f s) while %d running / %d waiting "
+                    "request(s) are live; the engine may have "
+                    "stopped stepping (client streams will hold).",
+                    gap,
+                    self._threshold_s,
+                    running,
+                    waiting,
+                )
+
+
 class EngineCore:
     """Inner loop of vLLM's Engine."""
 
@@ -1098,6 +1160,24 @@ class EngineCoreProc(EngineCore):
                 internal_dp_balancing,
             )
 
+            # Optional stall sentinel (off by default):
+            #   VLLM_ENGINE_STALL_SENTINEL_S=<seconds>
+            # Warns once per episode when the core stops completing steps
+            # while requests are still alive -- the failure class that logs
+            # nothing else in V1 (no stats line, no completion line, no
+            # error). Constructed here, after super().__init__(), because
+            # that is what creates self.scheduler.
+            self._stall_sentinel: _StallSentinel | None = None
+            _stall_thresh = envs.VLLM_ENGINE_STALL_SENTINEL_S
+            if _stall_thresh > 0:
+                self._stall_sentinel = _StallSentinel(
+                    self.scheduler.get_request_counts, _stall_thresh
+                )
+                logger.info(
+                    "EngineCore stall sentinel enabled (threshold %.0f s)",
+                    _stall_thresh,
+                )
+
             # Initialize fault tolerance settings.
             self.enable_fault_tolerance = (
                 vllm_config.parallel_config.enable_fault_tolerance
@@ -1475,6 +1555,8 @@ class EngineCoreProc(EngineCore):
             self.output_queue.put_nowait(output)
         # Post-step hook.
         self.post_step(model_executed)
+        if self._stall_sentinel is not None:
+            self._stall_sentinel.step_done()
 
         # If no model execution happened but there is still scheduler work
         # (e.g. WAITING_FOR_REMOTE_KVS or delayed KV connector frees), yield
