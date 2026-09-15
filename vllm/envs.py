@@ -26,6 +26,7 @@ if TYPE_CHECKING:
     VLLM_ENGINE_READY_TIMEOUT_S: int = 600
     VLLM_CHAT_TEMPLATE_RENDER_TIMEOUT: float = 30.0
     VLLM_CHAT_TEMPLATE_FUEL: int = 500000
+    VLLM_ENGINE_STALL_SENTINEL_S: float = 0.0
     VLLM_API_KEY: str | None = None
     VLLM_DEBUG_LOG_API_SERVER_RESPONSE: bool = False
     S3_ACCESS_KEY_ID: str | None = None
@@ -864,6 +865,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "LOCAL_RANK": lambda: int(os.environ.get("LOCAL_RANK", "0")),
     # used to control the visible devices in the distributed setting
     "CUDA_VISIBLE_DEVICES": lambda: os.environ.get("CUDA_VISIBLE_DEVICES", None),
+    # Warn when the engine core stops completing steps while requests are
+    # still alive, after this many seconds. 0 (default) disables the check.
+    "VLLM_ENGINE_STALL_SENTINEL_S": lambda: float(
+        os.environ.get("VLLM_ENGINE_STALL_SENTINEL_S", "0")
+    ),
     # Timeout in seconds for waiting for engine cores to become ready
     # during startup. Default is 600 seconds (10 minutes).
     "VLLM_ENGINE_READY_TIMEOUT_S": lambda: int(
