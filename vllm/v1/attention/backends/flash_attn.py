@@ -2188,3 +2188,31 @@ def _spec_attn_run(impl, q, key_cache, value_cache, out, cu_seqlens_q, seqused_k
     att.run(q, key_cache, value_cache, out, cu_seqlens_q, seqused_k, block_table, impl.scale,
             cu_seqlens_q.shape[0] - 1, max_seqlen_q,
             k_scale_cache=k_scale_cache, v_scale_cache=v_scale_cache)
+
+
+def _spec_attn_run_fp8(impl, q, key_cache, value_cache, out, cu_seqlens_q, seqused_k, block_table, max_seqlen_q,
+                       k_descale, v_descale, q_descale=None):
+    """The split-KV verify on vLLM's per-tensor fp8 cache (sm89+): same kernel and buffers as
+    _spec_attn_run, with the layer's scalar k/v scales and, when vLLM quantized the query too,
+    its q scale. A separate entry point so the int8 helper above stays byte-identical
+    (verify.sh detects patches by their lines)."""
+    from vllm.v1.attention.ops.spec_decode_attn import SpecDecodeAttention
+
+    key = (impl.num_heads, impl.head_size, q.device)
+    att = _SPEC_ATTN.get(key)
+    if att is None:
+        from vllm.config import get_current_vllm_config
+
+        try:
+            max_reqs = get_current_vllm_config().scheduler_config.max_num_seqs
+        except Exception:
+            max_reqs = 256
+        max_reqs = max(max_reqs, cu_seqlens_q.shape[0] - 1)
+        att = SpecDecodeAttention(
+            max_reqs, impl.num_heads, impl.head_size, q.device,
+            qmax=_spec_attn_qmax(impl.num_heads // impl.num_kv_heads),
+        )
+        _SPEC_ATTN[key] = att
+    att.run(q, key_cache, value_cache, out, cu_seqlens_q, seqused_k, block_table, impl.scale,
+            cu_seqlens_q.shape[0] - 1, max_seqlen_q,
+            k_descale=k_descale, v_descale=v_descale, q_descale=q_descale)
