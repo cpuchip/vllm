@@ -408,7 +408,11 @@ class CudaGraphManager:
                             set_graph_pool_id(current_platform.graph_pool_handle())
                         if self._capture_mem_samples is not None:
                             torch.accelerator.synchronize()
-                            free_before = torch.accelerator.get_memory_info()[0]
+                            # Sampled by the allocator's reserved bytes, the
+                            # same reading capture_model returns, so the
+                            # estimate never mixes an allocator total with
+                            # driver-measured samples.
+                            reserved_before = torch.accelerator.memory_reserved()
                         with torch.cuda.graph(
                             graph, self.pool, stream=current_stream()
                         ):
@@ -420,8 +424,8 @@ class CudaGraphManager:
                             get_offloader().join_after_forward()
                         if self._capture_mem_samples is not None:
                             torch.accelerator.synchronize()
-                            free_after = torch.accelerator.get_memory_info()[0]
-                            self._capture_mem_samples.append(free_before - free_after)
+                            reserved_after = torch.accelerator.memory_reserved()
+                            self._capture_mem_samples.append(reserved_after - reserved_before)
                         self.graphs[desc] = graph
                         compilation_counter.num_cudagraph_captured += 1
         self._graphs_captured = True
