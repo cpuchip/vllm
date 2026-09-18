@@ -548,6 +548,18 @@ class Worker(WorkerBase):
                 getattr(self.parallel_config, "_api_process_count", 1),
             )
 
+        # Let compilation settle before the measured pass. On a cold compile
+        # cache the first profile_run carries torch.compile and Triton JIT
+        # scratch inside the measured window, so transient_peak_headroom reads
+        # the compiler's peak, not the model's: on a 24 GiB card at
+        # gpu_memory_utilization 0.90 that read 0.95 GiB high on a cold boot
+        # and refused the KV cache the warm boot then granted. Run the dummy
+        # pass once uncounted, release the allocator's cached blocks, and
+        # measure the second pass, which is the one every later request sees.
+        self.model_runner.profile_run()
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+
         # Execute a forward pass with dummy inputs to profile the memory usage
         # of the model.
         with memory_profiling(
