@@ -83,6 +83,7 @@ async def _align_prompts_to_server_tokenizer(
     model_id: str,
     input_requests: list[SampleRequest],
     ssl_context: ssl.SSLContext | bool | None = None,
+    headers: dict[str, str] | None = None,
 ) -> list[SampleRequest]:
     """Re-align prompts if local/server tokenizers disagree."""
     if not input_requests or not isinstance(input_requests[0].prompt, str):
@@ -90,6 +91,11 @@ async def _align_prompts_to_server_tokenizer(
 
     tok_url = f"{base_url}/tokenize"
     detok_url = f"{base_url}/detokenize"
+    # The benchmark requests carry the key from OPENAI_API_KEY; this probe
+    # must too, or a server bound with --api-key rejects it with a 401.
+    probe_headers = dict(headers or {})
+    if api_key := os.environ.get("OPENAI_API_KEY"):
+        probe_headers.setdefault("Authorization", f"Bearer {api_key}")
     connector = aiohttp.TCPConnector(ssl=ssl_context)
 
     async with aiohttp.ClientSession(connector=connector) as session:
@@ -105,6 +111,7 @@ async def _align_prompts_to_server_tokenizer(
                         "prompt": prompt,
                         "add_special_tokens": False,
                     },
+                    headers=probe_headers,
                 ) as r,
             ):
                 r.raise_for_status()
@@ -114,7 +121,9 @@ async def _align_prompts_to_server_tokenizer(
             async with (
                 sem,
                 session.post(
-                    detok_url, json={"model": model_id, "tokens": tokens}
+                    detok_url,
+                    json={"model": model_id, "tokens": tokens},
+                    headers=probe_headers,
                 ) as r,
             ):
                 r.raise_for_status()
@@ -122,11 +131,16 @@ async def _align_prompts_to_server_tokenizer(
 
         try:
             first_tokens = await _tokenize(input_requests[0].prompt)
+        except asyncio.TimeoutError:
+            print("WARNING: /tokenize probe timed out, skipping alignment.")
+            return input_requests
         except aiohttp.ClientConnectionError as e:
             print(f"WARNING: {base_url} unreachable ({e!r}), skipping alignment.")
             return input_requests
         except aiohttp.ClientResponseError as e:
-            if e.status == 404:
+            if e.status == 401:
+                hint = "401 Unauthorized: the server requires an API key"
+            elif e.status == 404:
                 hint = (
                     "404 Not Found: either this server has no /tokenize route,"
                     f" or it does not serve a model named `{model_id}`"
@@ -208,15 +222,23 @@ class SpecDecodeMetrics:
 
 
 async def fetch_spec_decode_metrics(
-    base_url: str, session: aiohttp.ClientSession
+    base_url: str,
+    session: aiohttp.ClientSession,
+    headers: dict[str, str] | None = None,
 ) -> SpecDecodeMetrics | None:
     """Fetch speculative decoding metrics from the server's Prometheus endpoint.
 
     Returns None if speculative decoding is not enabled or metrics are not available.
     """
     metrics_url = f"{base_url}/metrics"
+    # Same requirement as the /tokenize probe above: a server bound with
+    # --api-key rejects an unauthenticated scrape, and the caller's
+    # extra_headers only carries --header pairs, never the key.
+    scrape_headers = dict(headers or {})
+    if api_key := os.environ.get("OPENAI_API_KEY"):
+        scrape_headers.setdefault("Authorization", f"Bearer {api_key}")
     try:
-        async with session.get(metrics_url) as response:
+        async with session.get(metrics_url, headers=scrape_headers) as response:
             if response.status != 200:
                 return None
             text = await response.text()
@@ -281,7 +303,9 @@ class DiffusionMetrics:
 
 
 async def fetch_diffusion_metrics(
-    base_url: str, session: aiohttp.ClientSession
+    base_url: str,
+    session: aiohttp.ClientSession,
+    headers: dict[str, str] | None = None,
 ) -> DiffusionMetrics | None:
     """Fetch diffusion decoding metrics from the server's Prometheus endpoint.
 
@@ -289,8 +313,14 @@ async def fetch_diffusion_metrics(
     available.
     """
     metrics_url = f"{base_url}/metrics"
+    # Same requirement as the /tokenize probe above: a server bound with
+    # --api-key rejects an unauthenticated scrape, and the caller's
+    # extra_headers only carries --header pairs, never the key.
+    scrape_headers = dict(headers or {})
+    if api_key := os.environ.get("OPENAI_API_KEY"):
+        scrape_headers.setdefault("Authorization", f"Bearer {api_key}")
     try:
-        async with session.get(metrics_url) as response:
+        async with session.get(metrics_url, headers=scrape_headers) as response:
             if response.status != 200:
                 return None
             text = await response.text()
@@ -993,8 +1023,12 @@ async def benchmark(
     else:
         print("Self timing is set, using the timestamps from the trace file.")
 
-    spec_decode_metrics_before = await fetch_spec_decode_metrics(base_url, session)
-    diffusion_metrics_before = await fetch_diffusion_metrics(base_url, session)
+    spec_decode_metrics_before = await fetch_spec_decode_metrics(
+        base_url, session, headers=extra_headers
+    )
+    diffusion_metrics_before = await fetch_diffusion_metrics(
+        base_url, session, headers=extra_headers
+    )
 
     pbar = None if disable_tqdm else tqdm(total=len(input_requests))
 
@@ -1128,7 +1162,9 @@ async def benchmark(
         probe_stop.set()
         await probe_task
 
-    spec_decode_metrics_after = await fetch_spec_decode_metrics(base_url, session)
+    spec_decode_metrics_after = await fetch_spec_decode_metrics(
+        base_url, session, headers=extra_headers
+    )
     spec_decode_stats: dict[str, Any] | None = None
     if spec_decode_metrics_before is not None and spec_decode_metrics_after is not None:
         delta_drafts = (
@@ -1170,7 +1206,9 @@ async def benchmark(
                 "per_position_acceptance_rates": per_pos_rates,
             }
 
-    diffusion_metrics_after = await fetch_diffusion_metrics(base_url, session)
+    diffusion_metrics_after = await fetch_diffusion_metrics(
+        base_url, session, headers=extra_headers
+    )
     diffusion_stats: dict[str, Any] | None = None
     if diffusion_metrics_before is not None and diffusion_metrics_after is not None:
         delta_steps = (
@@ -2214,7 +2252,7 @@ async def main_async(args: argparse.Namespace) -> dict[str, Any]:
 
     if args.dataset_name in ("random", "prefix_repetition"):
         input_requests = await _align_prompts_to_server_tokenizer(
-            base_url, model_id, input_requests, ssl_context
+            base_url, model_id, input_requests, ssl_context, headers=headers
         )
 
     goodput_config_dict = check_goodput_args(args)
