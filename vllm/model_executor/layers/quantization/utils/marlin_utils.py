@@ -738,7 +738,9 @@ def apply_gptq_marlin_linear(
 
     a_scales = None
     if input_dtype == torch.int8:
-        assert wtype == scalar_types.uint4b8, (
+        # syv patch (marlin-int8-asym-zp): uint4 (zero-point) weights have an
+        # int8-activation kernel too; only 8-bit weights do not.
+        assert wtype in (scalar_types.uint4b8, scalar_types.uint4), (
             "W8A8-INT8 is not supported by marlin kernel."
         )
         reshaped_x, a_scales = marlin_quant_input(reshaped_x, input_dtype)
