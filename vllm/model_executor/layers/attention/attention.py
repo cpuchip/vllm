@@ -100,6 +100,7 @@ def _largest_kernel_block_within(
     per_token_bytes: int,
     page_budget: int,
     fallback: int,
+    divisor_of: int | None = None,
 ) -> int:
     """Largest supported kernel block size whose page fits in ``page_budget``.
 
@@ -114,11 +115,31 @@ def _largest_kernel_block_within(
     sizes = attn_backend.get_supported_kernel_block_sizes()
     max_block_size = page_budget // per_token_bytes
     candidates = [s for s in sizes if isinstance(s, int)]
-    candidates.extend(
-        max(s.base, max_block_size // s.base * s.base)
-        for s in sizes
-        if isinstance(s, MultipleOf)
-    )
+    for s in sizes:
+        if not isinstance(s, MultipleOf):
+            continue
+        scaled = max(s.base, max_block_size // s.base * s.base)
+        # (kvarn-v2) A padded SW drafter page next to a hybrid primary block: take the
+        # largest fitting block that also DIVIDES the primary block (a multiple of 128
+        # first, then of the base), so the group stays a divisor of the scheduler block
+        # and of prefix_match_unit. The largest aligned block alone lands on 432 against
+        # a 2176 primary at DFLASH_TOKENS=7, and CTX=huge + prefix caching (#179) is then
+        # refused: "prefix-cacheable KV cache group block sizes must be divisible by
+        # prefix_match_unit" (128). 0.29 picked 128 here.
+        if divisor_of:
+            for step in (128, s.base):
+                d = next(
+                    (
+                        d
+                        for d in range(max_block_size, step - 1, -1)
+                        if divisor_of % d == 0 and d % step == 0
+                    ),
+                    0,
+                )
+                if d:
+                    scaled = d
+                    break
+        candidates.append(scaled)
     if not candidates:
         return fallback
     smallest = min(candidates)
@@ -633,6 +654,13 @@ class Attention(nn.Module, AttentionLayerBase):
             # cannot run the primary block start from their smallest block and
             # ``unify`` scales it up by an integer ratio.
             shared_page = vllm_config.cache_config.skip_page_size_padded
+            # port(kvarn-v2): hybrid without skip layers: pad the drafter's
+            # SW pages to the mamba/primary page instead of wasting 16-token
+            # blocks inside 1.8 MB uniform pages (26x overhead).
+            if shared_page is None and str(
+                vllm_config.cache_config.cache_dtype
+            ).startswith("kvarn"):
+                shared_page = vllm_config.cache_config.mamba_page_size_padded
             # The backend owns its packing
             sw_per_token = self.attn_backend.customize_spec(
                 SlidingWindowSpec(
@@ -647,7 +675,11 @@ class Attention(nn.Module, AttentionLayerBase):
             ).real_page_size_bytes
             page_budget = shared_page or sw_per_token * block_size
             sw_block_size = _largest_kernel_block_within(
-                self.attn_backend, sw_per_token, page_budget, block_size
+                self.attn_backend,
+                sw_per_token,
+                page_budget,
+                block_size,
+                divisor_of=block_size if shared_page else None,
             )
             return SlidingWindowSpec(
                 block_size=sw_block_size,
