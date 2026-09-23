@@ -2359,6 +2359,16 @@ def compile_factors() -> dict[str, object]:
         "VLLM_CACHE_ROOT",
         # Runtime memory-plan persistence; does not affect compiled graphs.
         "VLLM_ENABLE_STARTUP_PLAN",
+        # This repo's runtime-only knobs (syv-ai/HyperQwen #183): read by the engine
+        # loop, the KV block manager, a log timer or not at all, never by traced code.
+        # Hashed, each new value cost a cold torch.compile (~227 s against ~150 s).
+        "VLLM_ENGINE_STALL_SENTINEL_S",
+        "VLLM_MAMBA_ALIGN_KEEP_CHECKPOINTS",
+        "VLLM_DFLASH2_CHAIN_LOG_SEC",
+        "VLLM_MARLIN_TUNE_DIR",
+        # The deprecated env spelling of --prefix-cache-retention-interval, which
+        # CacheConfig.compute_hash already leaves out of the hash for the same reason.
+        "VLLM_PREFIX_CACHE_RETENTION_INTERVAL",
         # Location-only derived paths: where a cache/config directory lives
         # cannot affect compiled artifacts, and hashing them means relocating
         # HOME or the XDG roots silently invalidates every compile cache
