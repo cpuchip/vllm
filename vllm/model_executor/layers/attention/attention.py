@@ -633,6 +633,13 @@ class Attention(nn.Module, AttentionLayerBase):
             # cannot run the primary block start from their smallest block and
             # ``unify`` scales it up by an integer ratio.
             shared_page = vllm_config.cache_config.skip_page_size_padded
+            # port(kvarn-v2): hybrid without skip layers: pad the drafter's
+            # SW pages to the mamba/primary page instead of wasting 16-token
+            # blocks inside 1.8 MB uniform pages (26x overhead).
+            if shared_page is None and str(
+                vllm_config.cache_config.cache_dtype
+            ).startswith("kvarn"):
+                shared_page = vllm_config.cache_config.mamba_page_size_padded
             # The backend owns its packing
             sw_per_token = self.attn_backend.customize_spec(
                 SlidingWindowSpec(
