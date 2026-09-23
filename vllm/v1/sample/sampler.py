@@ -289,6 +289,7 @@ class Sampler(nn.Module):
             sampling_metadata.generators,
             sampling_metadata.top_k,
             sampling_metadata.top_p,
+            k_max=sampling_metadata.top_k_max,
         )
 
         if greedy_sampled is None:
