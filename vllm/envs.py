@@ -222,6 +222,26 @@ if TYPE_CHECKING:
     VLLM_MAMBA_ALIGN_KEEP_CHECKPOINTS: bool = False
     VLLM_DRAFT_TEMP_SCALE: float = 1.0
     VLLM_MARLIN_REPACK_STAGED: str | None = None
+    KVARN_POW2_SLOT: bool = False
+    KVARN_POOL_MEM_FRAC: str | None = None
+    KVARN_FA_SCRATCH_CAP: str | None = None
+    KVARN_SINKHORN_ITERS: int = 8
+    KVARN_SINK_TOKENS: int = 128
+    KVARN_QUANT_SLIDING: bool = False
+    KVARN_FUSED_VERIFY: bool = True
+    KVARN_FUSED_VERIFY_MAXQ: int = 8
+    KVARN_FUSED_VERIFY_MIN_BLOCKS: int = 64
+    KVARN_DBG_LAYERS: bool = False
+    KVARN_POOL_SLOTS: int = 0
+    KVARN_LOOKUP_BLOCKS: int = 0
+    KVARN_SPEC_DEBUG: bool = False
+    KVARN_SHARED_VERIFY: bool = False
+    KVARN_FAST_FLUSH: bool = True
+    KVARN_DUMP_TILES: str = ""
+    KVARN_RTN_QUANTILE: str = ""
+    KVARN_NUM_KV_SPLITS: str | None = None
+    KVARN_FUSED_DECODE: bool = True
+    KVARN_SPLIT_K: str | None = None
     # GiB of vision-tower weights to keep in pinned host memory; 0 disables.
     VLLM_VISION_CPU_OFFLOAD_GB: float = 0.0
     VLLM_HUMMING_MOE_GEMM_TYPE: Literal["indexed", "grouped", "auto"] | None = None
@@ -1584,6 +1604,28 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_DRAFT_TEMP_SCALE": lambda: float(os.environ.get("VLLM_DRAFT_TEMP_SCALE", "1.0")),
     # sm80 Marlin repack staging buffer: "1"/"0" override, unset = on for compute capability 8.0 only
     "VLLM_MARLIN_REPACK_STAGED": lambda: os.environ.get("VLLM_MARLIN_REPACK_STAGED"),
+    # KVarN KV cache (kvarn/, Huawei CSL naming kept): the knobs its modules read. None-typed ones keep
+    # "unset" distinct from a value because the readers branch on presence.
+    "KVARN_POW2_SLOT": lambda: os.environ.get("KVARN_POW2_SLOT", "0") == "1",
+    "KVARN_POOL_MEM_FRAC": lambda: os.environ.get("KVARN_POOL_MEM_FRAC"),
+    "KVARN_FA_SCRATCH_CAP": lambda: os.environ.get("KVARN_FA_SCRATCH_CAP"),
+    "KVARN_SINKHORN_ITERS": lambda: int(os.environ.get("KVARN_SINKHORN_ITERS", "8")),
+    "KVARN_SINK_TOKENS": lambda: int(os.environ.get("KVARN_SINK_TOKENS", "128")),
+    "KVARN_QUANT_SLIDING": lambda: os.environ.get("KVARN_QUANT_SLIDING") == "1",
+    "KVARN_FUSED_VERIFY": lambda: os.environ.get("KVARN_FUSED_VERIFY", "1") == "1",
+    "KVARN_FUSED_VERIFY_MAXQ": lambda: int(os.environ.get("KVARN_FUSED_VERIFY_MAXQ", "8")),
+    "KVARN_FUSED_VERIFY_MIN_BLOCKS": lambda: int(os.environ.get("KVARN_FUSED_VERIFY_MIN_BLOCKS", "64")),
+    "KVARN_DBG_LAYERS": lambda: os.environ.get("KVARN_DBG_LAYERS") == "1",
+    "KVARN_POOL_SLOTS": lambda: int(os.environ.get("KVARN_POOL_SLOTS", "0")),
+    "KVARN_LOOKUP_BLOCKS": lambda: int(os.environ.get("KVARN_LOOKUP_BLOCKS", "0")),
+    "KVARN_SPEC_DEBUG": lambda: os.environ.get("KVARN_SPEC_DEBUG", "0") == "1",
+    "KVARN_SHARED_VERIFY": lambda: os.environ.get("KVARN_SHARED_VERIFY", "0") == "1",
+    "KVARN_FAST_FLUSH": lambda: os.environ.get("KVARN_FAST_FLUSH", "1") == "1",
+    "KVARN_DUMP_TILES": lambda: os.environ.get("KVARN_DUMP_TILES", ""),
+    "KVARN_RTN_QUANTILE": lambda: os.environ.get("KVARN_RTN_QUANTILE", ""),
+    "KVARN_NUM_KV_SPLITS": lambda: os.environ.get("KVARN_NUM_KV_SPLITS"),
+    "KVARN_FUSED_DECODE": lambda: os.environ.get("KVARN_FUSED_DECODE", "1") == "1",
+    "KVARN_SPLIT_K": lambda: os.environ.get("KVARN_SPLIT_K"),
     "VLLM_VISION_CPU_OFFLOAD_GB": lambda: float(
         os.environ.get("VLLM_VISION_CPU_OFFLOAD_GB", "0")
     ),
