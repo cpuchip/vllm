@@ -1022,6 +1022,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         with freeze_gc_for_cudagraph_capture():
             torch.accelerator.empty_cache()
             start_free_gpu_memory = torch.accelerator.get_memory_info()[0]
+            start_reserved = torch.accelerator.memory_reserved()
 
             with self.maybe_setup_dummy_loras(self.lora_config):
                 if capture_encoder:
@@ -1059,6 +1060,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     self.kv_connector.reset_capture_state()
 
             end_free_gpu_memory = torch.accelerator.get_memory_info()[0]
+            end_reserved = torch.accelerator.memory_reserved()
 
         if not profile_only:
             # Lock workspace to prevent resizing during execution. A resize after
@@ -1067,12 +1069,22 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         end_time = time.perf_counter()
         elapsed_time = end_time - start_time
-        cuda_graph_size = start_free_gpu_memory - end_free_gpu_memory
+        # The graphs live in the allocator's private pool, so its reserved
+        # bytes measure them on every platform. The driver's free-memory
+        # delta also counts whatever else moved during capture, and under
+        # WSL2's paravirtual driver that reading collapses to zero during a
+        # cold compile: 5.44 GiB reported for a 0.23 GiB pool, which the
+        # memory profiler then subtracts from the KV budget and refuses the
+        # boot. Keep the driver delta in the log; return the pool.
+        cuda_graph_size = end_reserved - start_reserved
+        driver_delta = start_free_gpu_memory - end_free_gpu_memory
         # This usually takes 5~20 seconds.
         logger.info(
-            "Graph capturing finished in %.0f secs, took %.2f GiB",
+            "Graph capturing finished in %.0f secs, took %.2f GiB "
+            "(driver free-memory delta %.2f GiB)",
             elapsed_time,
             cuda_graph_size / (1 << 30),
+            driver_delta / (1 << 30),
         )
         return cuda_graph_size
 
