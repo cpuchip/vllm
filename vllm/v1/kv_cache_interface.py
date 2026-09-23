@@ -68,6 +68,10 @@ class KVQuantMode(IntEnum):
     # rather than reusing an upstream kernel path. See KVCacheDTypeHandler.
     CUSTOM = 12
 
+    # KVarN is not upstream's: its value sits far from upstream's counter, which reached 11
+    # with ULTRAQUANT_4BIT (#57057) the release after KVarN took 11 (fork rule, vllm/CLAUDE.md).
+    KVARN = 100
+
     @property
     def is_per_token_head(self) -> bool:
         """True for any per-token-head quantization mode."""
@@ -117,6 +121,10 @@ class KVQuantMode(IntEnum):
         """
         return self == KVQuantMode.CUSTOM
 
+    def is_kvarn(self) -> bool:
+        """True for KVarN packed KV-cache quantization."""
+        return self == KVQuantMode.KVARN
+
 
 def get_kv_quant_mode(kv_cache_dtype: str) -> KVQuantMode:
     """Map a ``kv_cache_dtype`` string to a :class:`KVQuantMode`."""
@@ -144,6 +152,8 @@ def get_kv_quant_mode(kv_cache_dtype: str) -> KVQuantMode:
         return KVQuantMode[kv_cache_dtype.upper()]
     if kv_cache_dtype == "ultraquant_4bit":
         return KVQuantMode.ULTRAQUANT_4BIT
+    if isinstance(kv_cache_dtype, str) and kv_cache_dtype.startswith("kvarn_"):
+        return KVQuantMode.KVARN
     if isinstance(kv_cache_dtype, str) and kv_cache_dtype.startswith("fp8"):
         return KVQuantMode.FP8_PER_TENSOR
     return KVQuantMode.NONE
