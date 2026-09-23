@@ -159,6 +159,7 @@ class AttentionBackendEnum(Enum, metaclass=_AttentionBackendEnumMeta):
     CPU_ATTN = "vllm.v1.attention.backends.cpu_attn.CPUAttentionBackend"
     CPU_MLA = "vllm.v1.attention.backends.mla.cpu_mla.CPUMLABackend"
     AMX_MLA = "vllm.v1.attention.backends.mla.amx_mla.AMXMLABackend"
+    KVARN = "vllm.v1.attention.backends.kvarn_attn.KVarNAttentionBackend"
     TURBOQUANT = "vllm.v1.attention.backends.turboquant_attn.TurboQuantAttentionBackend"
     ROCM_OCTAVE = (
         "vllm.v1.attention.backends.rocm_octave_attn.RocmOctaveAttentionBackend"
