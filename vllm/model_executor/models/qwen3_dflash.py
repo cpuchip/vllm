@@ -225,6 +225,15 @@ class DFlashQwen3Attention(nn.Module):
         )
 
         self.sliding_window = sliding_window
+        # KVarN has no sliding-window backend; keep the drafter's SW layers in
+        # the native cache dtype while the target full-attention layers use KVarN.
+        if cache_config is not None and str(
+            getattr(cache_config, "cache_dtype", "auto")
+        ).startswith("kvarn"):
+            from copy import copy as _kv_copy
+
+            cache_config = _kv_copy(cache_config)
+            cache_config.cache_dtype = "auto"
         self.attn = Attention(
             self.num_heads,
             self.head_dim,
