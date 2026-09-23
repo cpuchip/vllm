@@ -660,6 +660,26 @@ class Attention(nn.Module, AttentionLayerBase):
                 page_size_padded=shared_page,
             )
         else:
+            if isinstance(self.kv_cache_dtype, str) and self.kv_cache_dtype.startswith(
+                "kvarn_"
+            ):
+                from vllm.model_executor.layers.quantization.kvarn.config import (
+                    KVarNConfig,
+                )
+
+                kvarn_config = KVarNConfig.from_cache_dtype(
+                    self.kv_cache_dtype, self.head_size
+                )
+                slot_bytes = kvarn_config.tile_bytes_aligned // kvarn_config.group
+                return FullAttentionSpec(
+                    block_size=block_size,
+                    num_kv_heads=self.num_kv_heads,
+                    head_size=self.head_size,
+                    head_size_v=self.head_size_v,
+                    dtype=self.kv_cache_torch_dtype,
+                    kv_quant_mode=quant_mode,
+                    state_content_bytes=slot_bytes,
+                )
             return FullAttentionSpec(
                 block_size=block_size,
                 num_kv_heads=self.num_kv_heads,
