@@ -1317,9 +1317,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             decode_graph_eligible=decode_graph_eligible,
             max_seq_len_np=max_seq_len_np,
         )
-        return batch_state, get_uniform_decode_token_count(
+        uniform_decode_token_count = get_uniform_decode_token_count(
             num_reqs, num_toks, max_query_len, decode_graph_eligible
         )
+        # A uniform-looking final prefill chunk is still prefill. Do not route
+        # it through a captured speculative-decode graph on a prefix-cache hit.
+        if uniform_decode_token_count is not None and batch_state.has_prefill:
+            uniform_decode_token_count = None
+        return batch_state, uniform_decode_token_count
 
     def prepare_inputs(
         self,

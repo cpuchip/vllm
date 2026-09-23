@@ -97,6 +97,9 @@ def _selector_walk_kernel(
             IS_DRAFTING=True,
             USE_FP64=USE_FP64,
         )
+        # A degenerate distribution can produce NaN scores. Keep the walk in
+        # bounds; the verify step will reject any bad proposal.
+        index = tl.where(index >= top_k, 0, index)
         # vLLM 0.28.0's rejection sampler expects pre-temperature logits. With TRUNCATE
         # the cached row is the truncated proposal (-inf outside the kept support).
         realized = scores
@@ -260,7 +263,7 @@ class DFlash2Speculator(DFlashSpeculator):
             device,
             cache_steps=self.num_speculative_steps,
         )
-        self._selector_tokens = torch.empty(
+        self._selector_tokens = torch.zeros(
             (self.max_num_reqs, self.draft_block),
             dtype=self.draft_tokens.dtype,
             device=device,
@@ -746,6 +749,8 @@ class DFlash2Speculator(DFlashSpeculator):
         scores = self._score_candidates(candidate_ids, unary_logits, hidden_states)
         # The walk writes the drafter's own block into _selector_tokens; it is copied into
         # draft_tokens below, where _apply_lookup can fuse it with the lookup.
+        # A degenerate selector can emit NaN/inf scores (kvarn-v2-runner); keep the walk finite.
+        scores = torch.nan_to_num(scores, nan=-1e30, posinf=1e30, neginf=-1e30)
         truncate = self._truncate and self._req_top_p is not None
         self.candidate_sampler.sample(
             candidate_ids,
