@@ -105,6 +105,7 @@ def _largest_kernel_block_within(
     fallback: int,
     kv_cache_spec: KVCacheSpec | None = None,
     divisor_of: int | None = None,
+    prefer_multiple_of: int | None = None,
 ) -> int:
     """Largest supported kernel block size whose page fits in ``page_budget``.
 
@@ -116,6 +117,8 @@ def _largest_kernel_block_within(
 
     With ``divisor_of``, prefer the largest fitting block that divides it, so the
     page can be scaled to ``divisor_of`` by an integer ratio instead of padded.
+    With ``prefer_multiple_of`` too, prefer among those the largest that is also a
+    multiple of it.
     """
     from vllm.v1.attention.backend import MultipleOf
 
@@ -141,6 +144,10 @@ def _largest_kernel_block_within(
             if divisor_of % b == 0
         )
         if dividing:
+            if prefer_multiple_of:
+                preferred = [b for b in dividing if b % prefer_multiple_of == 0]
+                if preferred:
+                    return max(preferred)
             return max(dividing)
     return max(fitting) if fitting else smallest
 
@@ -666,6 +673,15 @@ class Attention(nn.Module, AttentionLayerBase):
             # cannot run the primary block start from their smallest block and
             # ``unify`` scales it up by an integer ratio.
             shared_page = vllm_config.cache_config.skip_page_size_padded
+            # port(kvarn-v2): hybrid without skip layers: pad the drafter's
+            # SW pages to the mamba/primary page instead of wasting 16-token
+            # blocks inside 1.8 MB uniform pages (26x overhead).
+            kvarn_padded = False
+            if shared_page is None and str(
+                vllm_config.cache_config.cache_dtype
+            ).startswith("kvarn"):
+                shared_page = vllm_config.cache_config.mamba_page_size_padded
+                kvarn_padded = shared_page is not None
             # The backend owns its packing
             kv_cache_spec = self.attn_backend.customize_spec(
                 SlidingWindowSpec(
@@ -689,7 +705,15 @@ class Attention(nn.Module, AttentionLayerBase):
                 page_budget,
                 block_size,
                 kv_cache_spec,
-                divisor_of=None if shared_page else block_size,
+                # (kvarn-v2) The drafter's SW page padded to the primary page: its block
+                # must still DIVIDE the primary block, a multiple of 128 first, so the group
+                # stays a divisor of the scheduler block and of prefix_match_unit. The
+                # largest aligned block lands on 432 against a 2176 primary at
+                # DFLASH_TOKENS=7 (and the largest divisor on 272), and CTX=huge + prefix
+                # caching (#179) is then refused: "prefix-cacheable KV cache group block
+                # sizes must be divisible by prefix_match_unit" (128). 0.29 picked 128.
+                divisor_of=block_size if (kvarn_padded or not shared_page) else None,
+                prefer_multiple_of=128 if kvarn_padded else None,
             )
             return SlidingWindowSpec(
                 block_size=sw_block_size,
