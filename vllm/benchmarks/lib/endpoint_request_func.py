@@ -759,6 +759,10 @@ async def async_request_openai_audio(
                         for message in messages:
                             if type(message) is bytes:
                                 message = message.decode("utf-8")
+                            # port(bench-sse-keepalive): SSE comments (keep-alive pings)
+                            # are not JSON, as in the two request functions above.
+                            if message.startswith(":"):
+                                continue
                             chunk = message.removeprefix("data: ")
                             if chunk != "[DONE]":
                                 timestamp = time.perf_counter()
