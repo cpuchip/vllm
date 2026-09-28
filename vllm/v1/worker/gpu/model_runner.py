@@ -1714,6 +1714,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.free_states(scheduler_output)
             self.add_requests(scheduler_output)
             self.update_requests(scheduler_output)
+            if self.cache_config.cache_dtype.startswith("kvarn"):
+                # port(kvarn-v2): tell KVarN which pages this step moved to another
+                # KV-cache group, before preprocess_state writes mamba state into
+                # them (#208).
+                from vllm.v1.attention.backends.kvarn_attn import note_scheduled_blocks
+
+                note_scheduled_blocks(scheduler_output, self.kv_cache_config)
             self.block_tables.apply_staged_writes()
             if self.aux_output_connector is not None:
                 # Register this step before the GPU forward.
