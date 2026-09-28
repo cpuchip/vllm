@@ -1243,6 +1243,12 @@ class GPUModelRunner(
         # stale NaN/data from corrupting attention or SSM computation.
         if scheduler_output.new_block_ids_to_zero:
             self._zero_block_ids(scheduler_output.new_block_ids_to_zero)
+        if self.cache_config.cache_dtype.startswith("kvarn"):
+            # port(kvarn-v2): tell KVarN which pages this step moved to another
+            # KV-cache group, before preprocess_mamba writes state into them (#208).
+            from vllm.v1.attention.backends.kvarn_attn import note_scheduled_blocks
+
+            note_scheduled_blocks(scheduler_output, self.kv_cache_config)
         if scheduler_output.kv_cache_block_copies:
             copy_kv_cache_blocks_inplace(
                 self.kv_caches,
