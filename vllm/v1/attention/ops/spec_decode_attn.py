@@ -45,6 +45,7 @@ import vllm.envs as envs
 import torch
 import triton
 import triton.language as tl
+from triton.runtime.errors import OutOfResources
 
 NUM_SEGMENTS = 16
 BLOCK_M = 64       # query rows (q_len * G) per program at the default register budget
@@ -184,6 +185,11 @@ def _spec_attn_combine(
         tl.store(out_ptr + (q_start + i) * stride_ot + h * stride_oh + d, o.to(out_ptr.dtype.element_ty))
 
 
+
+# (device, BLOCK_M, D, cache dtype) -> the KV tile that launched there. Filled on first use,
+# so a device with less shared memory than sm86's pays the failed launch once.
+_TILE_FITS = {}
+
 class SpecDecodeAttention:
     """Holds the partial buffers; call .run(...) per layer."""
 
@@ -239,9 +245,13 @@ class SpecDecodeAttention:
             assert q_descale is not None, "fp8 query needs its descale"
         assert max_query_len <= self.qmax, "too many query tokens per request for this kernel"
         assert num_reqs <= self.max_num_reqs
-        # shared memory on sm86 is 99 KB: q tile + one K and one V tile + scores must fit
+        # shared memory on sm86 is 99 KB: q tile + one K and one V tile + scores must fit.
+        # Turing (sm75) has 64 KB, where a 64-token tile at D=256 needs 98,304 bytes; a tile
+        # that does not launch is halved below, and the size that did is remembered.
         block_m, qt, ntile, warps = self._plan(max_query_len, G, D)
         tile = 64 if (block_m <= 32 or D <= 128) else 32
+        fit = (q.device, block_m, D, key_cache.dtype)
+        tile = _TILE_FITS.get(fit, tile)
         if envs.VLLM_SPEC_ATTN_DEBUG:
             self._dbg_calls = getattr(self, "_dbg_calls", 0) + 1
             if self._dbg_calls in (1, 2, 500, 2000):
@@ -255,21 +265,29 @@ class SpecDecodeAttention:
                       f"seqused={seqused_k[:num_reqs].tolist()}", flush=True)
                 self._dbg_t0 = _t0
         grid = (num_reqs * ntile, Hkv, self.nseg)
-        _spec_attn_partial[grid](
-            q, key_cache, value_cache, block_table, seqused_k, cu_seqlens_q,
-            self.part_o, self.part_m, self.part_l,
-            k_scale_cache, v_scale_cache, k_descale, v_descale, q_descale,
-            scale,
-            q.stride(0), q.stride(1),
-            key_cache.stride(0), key_cache.stride(1), key_cache.stride(2),
-            value_cache.stride(0), value_cache.stride(1), value_cache.stride(2),
-            block_table.stride(0),
-            *(k_scale_cache.stride() if quant else (0, 0, 0)),
-            *(v_scale_cache.stride() if quant else (0, 0, 0)),
-            G=G, Hq=Hq, QMAX=self.qmax, D=D, BLOCK_SIZE=key_cache.shape[1], BLOCK_M=block_m,
-            TILE=tile, NSEG=self.nseg, QT=qt, NTILE=ntile, QUANT=quant, FP8=fp8, Q_FP8=q_fp8,
-            num_warps=warps, num_stages=1,
-        )
+        while True:
+            try:
+                _spec_attn_partial[grid](
+                    q, key_cache, value_cache, block_table, seqused_k, cu_seqlens_q,
+                    self.part_o, self.part_m, self.part_l,
+                    k_scale_cache, v_scale_cache, k_descale, v_descale, q_descale,
+                    scale,
+                    q.stride(0), q.stride(1),
+                    key_cache.stride(0), key_cache.stride(1), key_cache.stride(2),
+                    value_cache.stride(0), value_cache.stride(1), value_cache.stride(2),
+                    block_table.stride(0),
+                    *(k_scale_cache.stride() if quant else (0, 0, 0)),
+                    *(v_scale_cache.stride() if quant else (0, 0, 0)),
+                    G=G, Hq=Hq, QMAX=self.qmax, D=D, BLOCK_SIZE=key_cache.shape[1], BLOCK_M=block_m,
+                    TILE=tile, NSEG=self.nseg, QT=qt, NTILE=ntile, QUANT=quant, FP8=fp8, Q_FP8=q_fp8,
+                    num_warps=warps, num_stages=1,
+                )
+                break
+            except OutOfResources:
+                if tile <= 16:
+                    raise
+                tile //= 2
+        _TILE_FITS[fit] = tile
         _spec_attn_combine[(num_reqs, Hq, max_query_len)](
             self.part_o, self.part_m, self.part_l, out, cu_seqlens_q,
             out.stride(0), out.stride(1),
