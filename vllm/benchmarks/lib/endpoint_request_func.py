@@ -207,8 +207,9 @@ async def async_request_openai_completions(
                 handler = StreamedResponseHandler()
 
                 async for chunk_bytes in response.content.iter_any():
-                    chunk_bytes = chunk_bytes.strip()
-                    if not chunk_bytes:
+                    # port(bench-sse-keepalive): the SSE separators are data; stripping a chunk
+                    # glues a keep-alive comment to every message after it (see the patch header).
+                    if not chunk_bytes.strip():
                         continue
 
                     messages = handler.add_chunk(chunk_bytes)
@@ -384,8 +385,9 @@ async def async_request_openai_chat_completions(
                 first_chunk_received = False
                 handler = StreamedResponseHandler()
                 async for chunk_bytes in response.content.iter_any():
-                    chunk_bytes = chunk_bytes.strip()
-                    if not chunk_bytes:
+                    # port(bench-sse-keepalive): the SSE separators are data; stripping a chunk
+                    # glues a keep-alive comment to every message after it (see the patch header).
+                    if not chunk_bytes.strip():
                         continue
 
                     message_strings = handler.add_chunk(chunk_bytes)
@@ -513,14 +515,19 @@ async def async_request_openai_audio(
                     handler = StreamedResponseHandler()
 
                     async for chunk_bytes in response.content.iter_any():
-                        chunk_bytes = chunk_bytes.strip()
-                        if not chunk_bytes:
+                        # port(bench-sse-keepalive): the SSE separators are data; stripping a chunk
+                        # glues a keep-alive comment to every message after it (see the patch header).
+                        if not chunk_bytes.strip():
                             continue
 
                         messages = handler.add_chunk(chunk_bytes)
                         for message in messages:
                             if type(message) is bytes:
                                 message = message.decode("utf-8")
+                            # port(bench-sse-keepalive): SSE comments (keep-alive pings)
+                            # are not JSON, as in the two request functions above.
+                            if message.startswith(":"):
+                                continue
                             chunk = message.removeprefix("data: ")
                             if chunk != "[DONE]":
                                 timestamp = time.perf_counter()
