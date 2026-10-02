@@ -613,6 +613,7 @@ class DFlash2Speculator(DFlashSpeculator):
         else:
             hidden_states = last_hidden_states
         self.hidden_states[:num_target_tokens].copy_(hidden_states[:num_target_tokens])
+        self.prepare_context_anchor(input_batch, num_rejected)
 
         # Same input preparation as the base path: the verify side needs slot
         # mappings / context positions, and suffix_lookup needs
@@ -638,6 +639,9 @@ class DFlash2Speculator(DFlashSpeculator):
                 seeds,
                 self.block_tables.input_block_tables[gid],
                 self.block_tables.kernel_block_sizes[gid],
+                self.block_tables.cp_rank,
+                self.dcp_size,
+                self.block_tables.cp_interleave,
                 self.parallel_drafting_token_id,
                 self.num_query_per_req,
                 self.draft_block,
@@ -684,10 +688,10 @@ class DFlash2Speculator(DFlashSpeculator):
         if draft_logits is None:
             # Greedy rejection sampling does not consume a proposal distribution.
             return self.draft_tokens[:num_reqs]
-        block_k = triton.next_power_of_2(self.selector_top_k)
+        block_k = triton.next_power_of_2(self.top_k)
         _point_mass_draft_logits_kernel[(num_reqs * k,)](
             draft_logits,
-            self._cached_candidate_ids,
+            self.candidate_sampler.cached_candidate_ids,
             self.draft_tokens,
             self.draft_tokens.stride(0),
             self._lookup_use,
@@ -696,7 +700,7 @@ class DFlash2Speculator(DFlashSpeculator):
             draft_logits.stride(0),
             draft_logits.stride(1),
             num_steps=k,
-            top_k=self.selector_top_k,
+            top_k=self.top_k,
             BLOCK_K=block_k,
             num_warps=1,
         )
