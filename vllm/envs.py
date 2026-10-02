@@ -413,6 +413,9 @@ if TYPE_CHECKING:
     VLLM_USE_SIMPLE_KV_OFFLOAD: bool = False
     VLLM_USE_SPINLOOP_EXT: bool = False
     VLLM_SKIP_VERSION_SUFFIX: bool = False
+    # KVarN fp16 dequant (kvarn-fp16-dequant-0.30.0), apart from the kvarn-0.30.0 block so
+    # each KVarN patch still reverse-applies on its own in a fully installed tree.
+    KVARN_FP16_DEQUANT: bool = False
 
 
 def get_default_cache_root():
@@ -2547,6 +2550,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_REQUEST_BODY_LOG_LEVEL": lambda: os.getenv(
         "VLLM_REQUEST_BODY_LOG_LEVEL", "DEBUG"
     ).upper(),
+    # KVarN: run the fused decode kernels' dequant math in fp16 (default off).
+    "KVARN_FP16_DEQUANT": lambda: os.environ.get("KVARN_FP16_DEQUANT", "0") == "1",
 }
 
 
