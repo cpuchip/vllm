@@ -543,6 +543,15 @@ class Worker(WorkerBase):
             # still need a profile run which compiles the model for
             # max_num_batched_tokens
             self.model_runner.profile_run()
+            # The KV cache is allocated right after this return, on top of
+            # whatever the profile run left in the allocator's cache. On a
+            # cold compile cache that is the torch.compile and Triton
+            # autotune scratch (1.2 GiB on a 24 GiB card), which the pinned
+            # size does not budget for: the pool then over-commits the card,
+            # and under WSL2's driver the overflow is moved to system RAM
+            # and read over PCIe. Release it, as the measured path below does.
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
 
             msg = (
                 f"Initial free memory {format_gib(self.init_snapshot.free_memory)} "
