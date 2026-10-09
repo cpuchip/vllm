@@ -26,6 +26,7 @@ from vllm.model_executor.models.qwen3_5 import (
     Qwen3_5DecoderLayer,
     Qwen3_5Model,
     Qwen3_5RMSNorm,
+    _offload_quantized_embedding_to_uva,
 )
 from vllm.model_executor.models.qwen3_next import (
     Qwen3NextSparseMoeBlock,
@@ -221,7 +222,10 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
             ckpt_prefix="mlp.shared_expert",
         )
         loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+        loaded = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+        if not getattr(self.config, "tie_word_embeddings", False):
+            _offload_quantized_embedding_to_uva(self.embed_tokens)
+        return loaded
 
 
 @support_torch_compile(
