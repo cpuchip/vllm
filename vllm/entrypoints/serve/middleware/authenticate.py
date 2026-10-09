@@ -9,12 +9,24 @@ from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 # The paths that answer without the API key: the liveness and readiness
-# probes, and the load and version endpoints. Every other path on the app
-# needs a bearer token. This includes the inference routes, /tokenize (it
-# renders arbitrary text through the chat template), /metrics and the docs.
-# A route that is added later is therefore guarded by default. A scraper
-# that cannot send the key belongs on a separate listener, not in this set.
-UNGUARDED_PATHS = frozenset({"/health", "/ping", "/load", "/version"})
+# probes, the load and version endpoints, and Ollama discovery routes
+# (/, /api/status, /api/experimental/model-recommendations, /api/show)
+# used by client launchers like `ollama launch codex`. Every other path
+# on the app needs a bearer token. This includes the inference routes,
+# /tokenize (it renders arbitrary text through the chat template),
+# /metrics and the docs. A route that is added later is therefore guarded
+# by default. A scraper that cannot send the key belongs on a separate
+# listener, not in this set.
+UNGUARDED_PATHS = frozenset({
+    "/health",
+    "/ping",
+    "/load",
+    "/version",
+    "/",
+    "/api/status",
+    "/api/experimental/model-recommendations",
+    "/api/show",
+})
 
 
 def _is_cors_preflight(scope: Scope, headers: Headers) -> bool:
