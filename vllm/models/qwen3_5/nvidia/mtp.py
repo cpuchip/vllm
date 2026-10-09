@@ -29,6 +29,7 @@ from vllm.model_executor.models.interfaces import (
     SupportsPP,
     _require_is_multimodal,
 )
+from vllm.model_executor.models.qwen3_5 import _offload_quantized_embedding_to_uva
 from vllm.model_executor.models.qwen3_next import QwenNextMixtureOfExperts
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
@@ -202,7 +203,10 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+        loaded = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+        if not getattr(self.config, "tie_word_embeddings", False):
+            _offload_quantized_embedding_to_uva(self.embed_tokens)
+        return loaded
 
 
 class Qwen3_5MTP(LocalArgmaxMixin, nn.Module, SupportsMultiModal, SupportsPP):

@@ -93,6 +93,7 @@ from vllm.model_executor.models.qwen2_moe import Qwen2MoeMLP as Qwen3NextMLP
 from vllm.model_executor.models.qwen3_5 import (
     Qwen3_5MoeProcessingInfo,
     Qwen3_5ProcessingInfo,
+    _offload_quantized_embedding_to_uva,
 )
 from vllm.model_executor.models.qwen3_next import (
     Qwen3NextAttention,
@@ -624,7 +625,10 @@ class Qwen3_5Model(nn.Module, EagleModelMixin):
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+        loaded = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+        if not getattr(self.config, "tie_word_embeddings", False):
+            _offload_quantized_embedding_to_uva(self.embed_tokens)
+        return loaded
 
 
 class Qwen3_5ForCausalLMBase(
