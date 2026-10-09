@@ -182,6 +182,7 @@ if TYPE_CHECKING:
     # syv patch: split-KV verify attention, registered by the patch that reads it (#114)
     VLLM_SPEC_DECODE_ATTN: bool = False
     VLLM_SPEC_DECODE_ATTN_QMAX: int = 0
+    VLLM_EMBED_UVA: bool = False
     VLLM_SPEC_ATTN_BLOCK_M: int = 0
     # syv patch: split-KV verify debug print (patches/triton-spec-attn-fp8-kv.patch)
     VLLM_SPEC_ATTN_DEBUG: bool = False
@@ -1512,6 +1513,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_DP_MASTER_PORT": lambda: int(os.getenv("VLLM_DP_MASTER_PORT", "0")),
     "VLLM_SPEC_DECODE_ATTN": lambda: os.environ.get("VLLM_SPEC_DECODE_ATTN", "0") == "1",
     "VLLM_SPEC_DECODE_ATTN_QMAX": lambda: int(os.environ.get("VLLM_SPEC_DECODE_ATTN_QMAX", "0")),
+    # Qwen3.5 family: keep the quantized token embedding in pinned host RAM (default off).
+    "VLLM_EMBED_UVA": lambda: os.environ.get("VLLM_EMBED_UVA", "0") == "1",
     "VLLM_SPEC_ATTN_BLOCK_M": lambda: int(os.environ.get("VLLM_SPEC_ATTN_BLOCK_M", "0")),
     # split-KV verify kernel: debug print
     "VLLM_SPEC_ATTN_DEBUG": lambda: os.environ.get("VLLM_SPEC_ATTN_DEBUG", "0") == "1",
