@@ -30,6 +30,7 @@ from typing import ClassVar
 import torch
 from torch import nn
 
+from vllm import envs
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.distributed import (
@@ -59,6 +60,7 @@ from vllm.multimodal.inputs import MultiModalFeatureSpec
 from vllm.sequence import IntermediateTensors
 from vllm.tokenizers.registry import cached_tokenizer_from_config
 from vllm.transformers_utils.configs.qwen3_5 import Qwen3_5Config, Qwen3_5TextConfig
+from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
 from vllm.transformers_utils.configs.qwen3_5_moe import (
     Qwen3_5MoeConfig,
     Qwen3_5MoeTextConfig,
@@ -103,6 +105,34 @@ from .utils import (
 )
 
 logger = init_logger(__name__)
+
+
+def _offload_quantized_embedding_to_uva(embedding: nn.Module) -> None:
+    """VLLM_EMBED_UVA=1: keep the packed embedding table in pinned host RAM.
+
+    The table is read through a CUDA UVA view, so a decode step pulls one row per
+    request over PCIe instead of holding the whole table in VRAM; the freed
+    memory goes to the KV pool. Only a quantized table (weight_packed, from
+    qwen3_5-embed-quant) is moved, and the callers skip tied embeddings, whose
+    lm_head would read the whole table from host RAM on every step.
+    """
+    if not envs.VLLM_EMBED_UVA:
+        return
+    weight = getattr(embedding, "weight_packed", None)
+    if weight is None:
+        logger.warning_once(
+            "VLLM_EMBED_UVA=1 but the token embedding is not quantized "
+            "(no weight_packed); leaving it in VRAM."
+        )
+        return
+    if getattr(weight, "_vllm_is_uva_offloaded", False):
+        return
+
+    cpu_weight = weight.data.to("cpu").pin_memory()
+    weight.data = get_accelerator_view_from_cpu_tensor(cpu_weight)
+    weight._vllm_is_uva_offloaded = True
+
+    torch.cuda.empty_cache()
 
 
 class Qwen3_5ProcessingInfo(Qwen3VLProcessingInfo):
@@ -290,7 +320,10 @@ class Qwen3_5Model(Qwen3NextModel):
                 ckpt_prefix="mlp.shared_expert",
             )
         loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+        loaded = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+        if not getattr(self.config, "tie_word_embeddings", False):
+            _offload_quantized_embedding_to_uva(self.embed_tokens)
+        return loaded
 
 
 class Qwen3_5ForCausalLMBase(
