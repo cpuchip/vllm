@@ -1,9 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
+import re
 import warnings
 from argparse import Namespace
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from starlette.responses import JSONResponse
 
 from vllm.config import ModelConfig
 from vllm.entrypoints.serve.exception_handling.register import init_exception_handler
@@ -41,6 +44,102 @@ def build_app(
         app = FastAPI(lifespan=lifespan)
     app.state.args = args
     app.root_path = args.root_path
+
+    # Compatibility endpoint for clients that probe the server root
+    # before using the OpenAI-compatible API.
+    @app.api_route(
+        "/",
+        methods=["GET", "HEAD"],
+        include_in_schema=False,
+    )
+    async def root():
+        return {"status": "ok"}
+
+    # Minimal Ollama compatibility endpoints used by `ollama launch codex`.
+    @app.get("/api/status", include_in_schema=False)
+    async def ollama_status():
+        return {"status": "ok"}
+
+    @app.get("/api/experimental/model-recommendations", include_in_schema=False)
+    async def ollama_model_recommendations():
+        return {"models": []}
+
+    @app.post("/api/show", include_in_schema=False)
+    async def ollama_show(request: Request):
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        req_model = str(body.get("model", "") or body.get("name", "")).strip()
+
+        # Collect configured served model names and underlying model paths
+        served_names: list[str] = []
+        raw_served = getattr(args, "served_model_name", None)
+        if raw_served:
+            if isinstance(raw_served, list):
+                served_names.extend(str(s) for s in raw_served)
+            else:
+                served_names.append(str(raw_served))
+        if getattr(args, "model", None):
+            served_names.append(str(args.model))
+        if model_config and getattr(model_config, "model", None):
+            served_names.append(str(model_config.model))
+
+        # Deduplicate while preserving order
+        unique_served: list[str] = list(dict.fromkeys(served_names))
+
+        def _matches(candidate: str, target: str) -> bool:
+            c = candidate.lower()
+            t = target.lower()
+            if c == t or c == os.path.basename(t):
+                return True
+            # Match colon tags or hyphens (e.g. qwen3.8:27b vs qwen3.8-27b)
+            if c.replace(":", "-") == t.replace(":", "-"):
+                return True
+            # Match without :latest
+            if c.removesuffix(":latest") == t or t.removesuffix(":latest") == c:
+                return True
+            # Prefix match before tag (e.g. qwen3.8 vs qwen3.8:27b)
+            if c.split(":")[0] == t.split(":")[0]:
+                return True
+            return False
+
+        matched = (
+            any(_matches(req_model, name) for name in unique_served)
+            if (unique_served and req_model)
+            else True
+        )
+
+        if not matched:
+            return JSONResponse(
+                status_code=404,
+                content={
+                    "error": f"model '{req_model}' not found"
+                },
+            )
+
+        # Context length from model_config, falling back to args or 262144
+        context_len = (
+            getattr(model_config, "max_model_len", None)
+            or getattr(args, "max_model_len", None)
+            or 262144
+        )
+
+        # Parameter size heuristic from model name if available
+        param_match = re.search(
+            r"(\d+(\.\d+)?[bB])",
+            str(getattr(args, "model", "") or req_model),
+        )
+        param_size = param_match.group(1).upper() if param_match else "27B"
+
+        return {
+            "model_info": {
+                "general.context_length": context_len,
+            },
+            "details": {
+                "parameter_size": param_size,
+            },
+        }
 
     register_api_routers(args, app, supported_tasks, model_config)
 
