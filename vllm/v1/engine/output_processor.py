@@ -363,6 +363,7 @@ class RequestState:
         kv_transfer_params: dict[str, Any] | None = None,
         ec_transfer_params: dict[str, Any] | None = None,
         error: RequestError | None = None,
+        num_computed_tokens: int | None = None,
     ) -> RequestOutput | PoolingRequestOutput | None:
         finished = finish_reason is not None
         final_only = self.output_kind == RequestOutputKind.FINAL_ONLY
@@ -377,6 +378,7 @@ class RequestState:
                 [self._new_pooling_output(pooling_output)],
                 finished,
                 error=error,
+                num_computed_tokens=num_computed_tokens,
             )
 
         if self.stream_interval > 1:
@@ -420,6 +422,7 @@ class RequestState:
             finished,
             kv_transfer_params,
             ec_transfer_params,
+            num_computed_tokens=num_computed_tokens,
         )
 
     def _new_request_output(
@@ -430,6 +433,7 @@ class RequestState:
         kv_transfer_params: dict[str, Any] | None = None,
         ec_transfer_params: dict[str, Any] | None = None,
         error: RequestError | None = None,
+        num_computed_tokens: int | None = None,
     ) -> RequestOutput | PoolingRequestOutput:
         # If prompt embeds were used, put placeholder prompt token ids
         prompt_token_ids = self.prompt_token_ids
@@ -472,6 +476,7 @@ class RequestState:
             ec_transfer_params=ec_transfer_params,
             num_cached_tokens=self.num_cached_tokens,
             num_cache_creation_tokens=self.num_cache_creation_tokens,
+            num_computed_tokens=num_computed_tokens,
             metrics=self.stats,
         )
 
@@ -800,7 +805,8 @@ class OutputProcessor:
                     )
                 if req_state.remote_prefill_cached_tokens is not None:
                     req_state.num_cached_tokens = req_state.remote_prefill_cached_tokens
-                req_state.is_prefilling = False
+                if len(new_token_ids) > 0 or finish_reason is not None:
+                    req_state.is_prefilling = False
 
             if engine_core_output.spec_decode_metrics is not None:
                 req_state.spec_decode_metrics = engine_core_output.spec_decode_metrics
@@ -857,6 +863,7 @@ class OutputProcessor:
                 kv_transfer_params,
                 ec_transfer_params,
                 error=request_error,
+                num_computed_tokens=engine_core_output.num_computed_tokens,
             ):
                 if streaming_chunk_boundary:
                     request_output.finished = False
