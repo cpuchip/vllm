@@ -2499,8 +2499,18 @@ class Scheduler(SchedulerInterface):
                 stopped = True
 
             routed_experts = None
+            # Requests that opted into prefill-progress reporting get an output
+            # on every prefill chunk; ``num_computed_tokens`` is only carried
+            # for them so other requests pay no extra serialization cost.
+            wants_progress = (
+                request.sampling_params is not None
+                and request.sampling_params.return_progress
+            )
             should_emit_output = bool(
-                new_token_ids or pooler_output is not None or stopped
+                new_token_ids
+                or pooler_output is not None
+                or stopped
+                or (request.is_prefill_chunk and wants_progress)
             )
             if self.aux_output_connector is not None and should_emit_output:
                 routed_experts = self.aux_output_connector.take_output(
@@ -2611,10 +2621,15 @@ class Scheduler(SchedulerInterface):
                         routed_experts=routed_experts,
                         num_nans_in_logits=request.num_nans_in_logits,
                         watermarking=watermarking,
+                        num_computed_tokens=(
+                            request.num_computed_tokens if wants_progress else None
+                        ),
                     )
                 )
             else:
-                # Invariant: EngineCore returns no partial prefill outputs.
+                # Invariant: EngineCore returns no partial prefill outputs,
+                # except for requests that opted into progress reporting
+                # (handled by the is_prefill_chunk branch above).
                 assert not prompt_logprobs_tensors
                 assert prompt_token_id_logprobs is None
 
