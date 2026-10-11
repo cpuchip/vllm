@@ -13,7 +13,7 @@ import torch
 from vllm import _custom_ops as ops
 from vllm.distributed.device_communicators.cuda_wrapper import CudaRTLibrary
 from vllm.logger import init_logger
-from vllm.platforms import current_platform
+from vllm.platforms import current_platform, in_wsl
 from vllm.triton_utils import HAS_TRITON, triton
 from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import PIN_MEMORY
@@ -277,7 +277,10 @@ def pin_mmap_region(region: SharedOffloadRegion) -> None:
     # API for each registered chunk's device pointer and carry the delta into
     # pointer arithmetic. One delta serves the region only if every chunk maps at
     # the same offset; a region up to MAX_HOST_REGISTER_CHUNK_BYTES is one chunk.
-    # The delta is 0 on native Linux, so nothing changes there.
+    # Native Linux has UVA, so it keeps upstream's path and makes no query.
+    if not in_wsl():
+        return
+
     import ctypes as _ctypes
     import glob as _glob
     import os as _os
@@ -316,6 +319,7 @@ def pin_mmap_region(region: SharedOffloadRegion) -> None:
             _rc = _libcudart.cudaHostGetDevicePointer(
                 _ctypes.byref(_devptr), _ctypes.c_void_p(_address), 0)
             if _rc != 0 or not _devptr.value:
+                _libcudart.cudaGetLastError()
                 # Fail loud: host VAs on a platform where the device pointer is
                 # unavailable is the silent-unsafe shape this fix removes.
                 raise RuntimeError(
