@@ -381,6 +381,9 @@ class SamplingParams(
     include_stop_str_in_output: bool = False
     """Whether to include the stop strings in output text."""
     output_kind: RequestOutputKind = RequestOutputKind.CUMULATIVE
+    return_progress: bool = False
+    """Whether to emit prefill-progress outputs while the request is still
+    prefilling. Only consumed by the OpenAI-compatible streaming endpoints."""
     stream_interval: int | None = None
     """Number of newly generated tokens to batch into each streamed
     `RequestOutput`. Raises the interval above the engine-level
@@ -484,6 +487,7 @@ class SamplingParams(
         routed_experts_prompt_start: int = 0,
         # Debugging / RL-specific parameters.
         trace_decode_token_ids: list[int] | None = None,
+        return_progress: bool = False,
     ) -> "SamplingParams":
         if logit_bias is not None:
             # Fast path uses a dict comprehension; on failure we iterate once
@@ -551,6 +555,7 @@ class SamplingParams(
             repetition_detection=repetition_detection,
             routed_experts_prompt_start=routed_experts_prompt_start,
             trace_decode_token_ids=trace_decode_token_ids,
+            return_progress=return_progress,
         )
 
     def __post_init__(self) -> None:
