@@ -4,6 +4,7 @@ import hashlib
 import secrets
 from collections.abc import Awaitable
 
+from starlette._utils import get_route_path
 from starlette.datastructures import Headers
 from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Receive, Scope, Send
@@ -85,8 +86,9 @@ class AuthenticationMiddleware:
             # scope["type"] can be "lifespan" or "startup" for example,
             # in which case we don't need to do anything
             return self.app(scope, receive, send)
-        root_path = scope.get("root_path", "")
-        url_path = scope["path"].removeprefix(root_path)
+        # The path the router matches: removeprefix("/") would turn /health
+        # into "health" under --root-path /.
+        url_path = get_route_path(scope)
         # This middleware runs ahead of the router, so a path that differs from
         # an allowlisted one only by a trailing slash never reaches FastAPI's
         # redirect_slashes: match on the normalized path, or a liveness probe
