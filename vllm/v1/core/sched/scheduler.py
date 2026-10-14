@@ -2537,6 +2537,11 @@ class Scheduler(SchedulerInterface):
             request.spec_token_ids = self.structured_output_manager.validate_tokens(
                 request, spec_token_ids
             )
+            from vllm.v1 import debug_p320  # p320 instrumentation (scratch)
+
+            debug_p320.sched_trim(
+                "update_draft_token_ids", request, spec_token_ids, request.spec_token_ids
+            )
 
     def update_draft_token_ids_in_output(
         self, draft_token_ids: DraftTokenIds, scheduler_output: SchedulerOutput
@@ -2562,9 +2567,13 @@ class Scheduler(SchedulerInterface):
             # (needed for chunked prefill case for example).
             del spec_token_ids[orig_num_spec_tokens:]
             # Filter out spec tokens which do not adhere to the grammar.
+            _p320_proposed = list(spec_token_ids)
             spec_token_ids = self.structured_output_manager.validate_tokens(
                 request, spec_token_ids
             )
+            from vllm.v1 import debug_p320  # p320 instrumentation (scratch)
+
+            debug_p320.sched_trim("in_output", request, _p320_proposed, spec_token_ids)
             # Pad to original number of spec tokens.
             num_invalid_tokens = orig_num_spec_tokens - len(spec_token_ids)
             if num_invalid_tokens:

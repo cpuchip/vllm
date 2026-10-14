@@ -4563,13 +4563,21 @@ class GPUModelRunner(
         self.execute_model_state = None
 
         # Apply structured output bitmasks if present.
+        from vllm.v1 import debug_p320  # p320 instrumentation (scratch)
+
+        _p320 = None
         if grammar_output is not None:
+            _p320 = debug_p320.pre(
+                scheduler_output, grammar_output, self.input_batch, logits
+            )
             apply_grammar_bitmask(
                 scheduler_output, grammar_output, self.input_batch, logits
             )
+            debug_p320.post(_p320, logits)
 
         with record_function_or_nullcontext("gpu_model_runner: sample"):
             sampler_output = self._sample(logits, spec_decode_metadata)
+        debug_p320.done(_p320, sampler_output.sampled_token_ids)
 
         self._update_states_after_model_execute(
             sampler_output.sampled_token_ids, scheduler_output
