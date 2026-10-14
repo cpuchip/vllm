@@ -94,3 +94,64 @@ def done(info, sampled_token_ids):
             r["k"] = "step"
             r["step"] = _step
             _write(r)
+
+
+# ---- V2 model runner (vllm/v1/worker/gpu/model_runner.py), the runner 0.31 actually uses ----
+def _bit(row, tid):
+    return bool((int(row[tid // 32]) >> (tid % 32)) & 1)
+
+
+def pre_v2(input_batch, grammar_output, logits, num_bonus_tokens=1):
+    if not ENABLED or grammar_output is None:
+        return None
+    req_ids = list(input_batch.req_ids)
+    cu = input_batch.cu_num_logits.tolist()
+    ndt = input_batch.num_draft_tokens_per_req
+    li = input_batch.logits_indices.tolist()
+    ids = input_batch.input_ids
+    bm = grammar_output.grammar_bitmask
+    info, brow = [], 0
+    for rid in grammar_output.structured_output_request_ids:
+        i = req_ids.index(rid)
+        n_logits = cu[i + 1] - cu[i]
+        n_mask = (int(ndt[i]) + num_bonus_tokens) if ndt is not None else n_logits
+        rows = list(range(cu[i], cu[i + 1]))
+        x = logits[cu[i]:cu[i + 1]].float()
+        top = torch.topk(x, 2, dim=-1) if n_logits else None
+        info.append({
+            "req": rid, "i": i, "rows": rows, "n_logits": n_logits, "n_mask": n_mask,
+            "sched_allow_tc": [_bit(bm[brow + j], TC_CLOSE) for j in range(n_mask)],
+            "sched_allow_lt": [_bit(bm[brow + j], LT) for j in range(n_mask)],
+            "row_input": [int(t) for t in ids[[li[r] for r in rows]].tolist()] if rows else [],
+            "pre_top": top.indices.tolist() if top is not None else [],
+            "pre_tc": [round(v, 3) for v in x[:, TC_CLOSE].tolist()],
+        })
+        brow += n_mask
+    return info
+
+
+def done_v2(info, logits, sampler_output):
+    global _step
+    _step += 1
+    if info is None:
+        return
+    s = sampler_output.sampled_token_ids.tolist()
+    ns = sampler_output.num_sampled.tolist()
+    for r in info:
+        x = logits[r["rows"][0]:r["rows"][-1] + 1].float() if r["rows"] else None
+        if x is not None:
+            p = x.softmax(dim=-1)
+            r["post_allow_tc"] = torch.isfinite(x[:, TC_CLOSE]).tolist()
+            r["post_n_allowed"] = torch.isfinite(x).sum(dim=-1).tolist()
+            r["p_tc"] = [round(v, 5) for v in p[:, TC_CLOSE].tolist()]
+            r["p_lt"] = [round(v, 5) for v in p[:, LT].tolist()]
+        r["sampled"] = s[r["i"]][:ns[r["i"]]]
+        toks = set(r["row_input"]) | set(r["sampled"])
+        constrained = any(a and n < 100000 for a, n in zip(r.get("post_allow_tc", []), r.get("post_n_allowed", [])))
+        mismatch = r["n_mask"] != r["n_logits"] or any(
+            a != b for a, b in zip(r["sched_allow_tc"], r.get("post_allow_tc", [])))
+        if TC_CLOSE in toks or LT in toks or constrained or mismatch or any(t[0] == TC_CLOSE for t in r["pre_top"]):
+            r["k"] = "v2step"
+            r["step"] = _step
+            r["mismatch"] = mismatch
+            _write(r)

@@ -1602,7 +1602,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # A diffusion prefill has no logit rows even when a bitmask row
         # arrived for it.
+        from vllm.v1 import debug_p320  # p320 instrumentation (scratch)
+
+        _p320 = None
         if grammar_output is not None and logits.shape[0] > 0:
+            _p320 = debug_p320.pre_v2(
+                input_batch,
+                grammar_output,
+                logits,
+                self.structured_outputs_worker.num_bonus_tokens,
+            )
             # Apply grammar bitmask to the logits in-place.
             assert self.structured_outputs_worker is not None
             self.structured_outputs_worker.apply_grammar_bitmask(
@@ -1653,6 +1662,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
 
         assert sampler_output is not None
+        debug_p320.done_v2(_p320, logits, sampler_output)
         return sampler_output, sampler_output.num_sampled, sampler_output.num_rejected
 
     def postprocess_sampled(
