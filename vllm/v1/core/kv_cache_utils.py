@@ -2664,6 +2664,76 @@ def update_kv_cache_capacity(
         f"{max_model_len:,}",
         max_concurrency,
     )
+    log_kv_cache_seat_budget(vllm_config, kv_cache_config)
+
+
+def _device_group_blocks(
+    vllm_config: VllmConfig, kv_cache_config: KVCacheConfig, num_tokens: int
+) -> list[int]:
+    """Blocks one request is charged in each device group at ``num_tokens`` of
+    context: each group's admission cap (``max_memory_usage_bytes``, the figure
+    pool sizing and the runtime admission gate share), evaluated at
+    ``num_tokens`` instead of max_model_len."""
+    model_config = vllm_config.model_config
+    max_model_len = model_config.max_model_len
+    model_config.max_model_len = num_tokens
+    try:
+        return [
+            cdiv(
+                group.kv_cache_spec.max_memory_usage_bytes(vllm_config),
+                group.kv_cache_spec.page_size_bytes,
+            )
+            for group in kv_cache_config.kv_cache_groups
+            if not group.host_resident
+        ]
+    finally:
+        model_config.max_model_len = max_model_len
+
+
+def log_kv_cache_seat_budget(
+    vllm_config: VllmConfig, kv_cache_config: KVCacheConfig
+) -> None:
+    """Log how many requests the pool holds at once, by context length.
+
+    max_num_seqs caps admission, not residency. On a hybrid model every
+    resident request holds recurrent-state blocks for its whole life, so the
+    pool can hold far fewer requests than max_num_seqs admits; the rest wait,
+    and a full pool preempts. At the shortest length the line gives a range:
+    the low end charges the full admission cap, the high end only the blocks
+    that do not grow with context, because short requests are usually charged
+    less context than the cap allows.
+    """
+    usable = kv_cache_config.num_blocks - 1  # block 0 is the null block
+    if usable <= 0:
+        return
+    max_model_len = vllm_config.model_config.max_model_len
+    lengths = [n for n in (1024, 32768) if n < max_model_len] + [max_model_len]
+    blocks = {
+        n: _device_group_blocks(vllm_config, kv_cache_config, n)
+        for n in (1, *lengths)
+    }
+    total = {n: sum(per_group) for n, per_group in blocks.items()}
+    if not total[max_model_len]:
+        return
+    fixed = sum(a for a, b in zip(blocks[1], blocks[max_model_len]) if a == b)
+    parts = []
+    for n in lengths:
+        low = usable // total[n]
+        high = usable // fixed if fixed and n == lengths[0] else low
+        held = f"{low}" if high == low else f"{low}-{high}"
+        parts.append(f"{held} at {n:,}")
+    logger.info_once(
+        "KV cache seat budget: %d usable blocks of %d tokens; a request holds "
+        "%d blocks that do not grow with context, %d in all at %s tokens. "
+        "Resident requests by context length: %s tokens (max_num_seqs=%d)",
+        usable,
+        vllm_config.cache_config.block_size,
+        fixed,
+        total[max_model_len],
+        f"{max_model_len:,}",
+        ", ".join(parts),
+        vllm_config.scheduler_config.max_num_seqs,
+    )
 
 
 def _max_memory_usage_bytes_from_groups(
