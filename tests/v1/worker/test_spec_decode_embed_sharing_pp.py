@@ -79,6 +79,35 @@ def test_drafter_with_distinct_weights_keeps_them(monkeypatch):
     assert draft_inner.embed_tokens is draft_embed
 
 
+def _quantized(fill: float = 1.0) -> nn.Module:
+    """A layer whose weights live in packed parameters, with no plain `weight`."""
+    layer = nn.Module()
+    layer.weight_packed = nn.Parameter(
+        torch.full((VOCAB, HIDDEN // 4), fill), requires_grad=False
+    )
+    return layer
+
+
+@pytest.mark.parametrize("quantized", ["target", "draft", "both"])
+def test_quantized_copy_is_never_equal(quantized):
+    draft = _quantized() if quantized in ("draft", "both") else _embed(fill=1.0)
+    target = _quantized() if quantized in ("target", "both") else _embed(fill=1.0)
+    eagle = SimpleNamespace(has_own_lm_head=True)
+
+    assert not eagle_utils._should_share(eagle, "has_own_lm_head", draft, target)
+
+
+def test_drafter_keeps_its_embedding_beside_a_quantized_target(monkeypatch):
+    monkeypatch.setattr(eagle_utils, "get_pp_group", _fake_pp(1))
+    draft_embed = _embed(fill=1.0)
+    draft_inner = _inner(draft_embed)
+    draft = SimpleNamespace(has_own_embed_tokens=True)
+
+    eagle_utils.maybe_share_target_embed(draft, draft_inner, _inner(_quantized()))
+
+    assert draft_inner.embed_tokens is draft_embed
+
+
 def test_mtp_style_drafter_is_left_alone_under_pp(monkeypatch):
     monkeypatch.setattr(eagle_utils, "get_pp_group", _fake_pp(2))
     draft_embed = _embed()

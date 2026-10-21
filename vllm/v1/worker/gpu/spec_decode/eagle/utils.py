@@ -25,6 +25,12 @@ def _should_share(eagle: nn.Module, flag: str, draft, target) -> bool:
         return True
     if draft is None or target is None:
         return False
+    # A quantized layer (e.g. an int8 lm_head or embedding) has no plain
+    # `weight` tensor, so it cannot be compared and the draft keeps its own.
+    if not isinstance(getattr(draft, "weight", None), torch.Tensor) or not (
+        isinstance(getattr(target, "weight", None), torch.Tensor)
+    ):
+        return False
     # torch.equal on GPU allocates a bool mask the size of the input.
     # Use the faster GPU path when there is plenty of headroom;
     # otherwise compare on CPU.
