@@ -774,6 +774,7 @@ class OpenAIServingChat(GenerateBaseServing):
                             output.finish_reason is None
                             and logprobs is None
                             and (not request.return_token_ids or hide_stream_metadata)
+                            and not include_continuous_usage
                         ):
                             continue
                         delta_message = DeltaMessage()
