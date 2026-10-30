@@ -1084,7 +1084,10 @@ def get_max_concurrency_for_kv_cache_config(
             host_blocks_per_request += required
         else:
             num_blocks_per_request += required
-    limits = [kv_cache_config.num_blocks / num_blocks_per_request]
+    # BlockPool permanently removes one physical block as its null block.
+    # Admission/auto-fit already reserve its bytes; report the same usable pool.
+    usable_blocks = max(0, kv_cache_config.num_blocks - 1)
+    limits = [usable_blocks / num_blocks_per_request]
     if host_blocks_per_request:
         assert kv_cache_config.hisparse_host_num_blocks is not None
         limits.append(
