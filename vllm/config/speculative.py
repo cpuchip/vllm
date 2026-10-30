@@ -1439,6 +1439,27 @@ class SpeculativeConfig:
         return self.speculator_config.uses_separate_workspace_lane
 
     @staticmethod
+    def _validate_dflash_context_capacity(
+        target_max_model_len: int,
+        draft_max_model_len: int,
+        num_speculative_tokens: int,
+    ) -> None:
+        # DFlash embeds both target context positions and a fixed query block
+        # (bonus token plus drafts). Its RoPE cache must cover that whole
+        # block even when the target will discard lookahead at its limit.
+        lookahead = num_speculative_tokens + 1
+        if target_max_model_len + lookahead > draft_max_model_len:
+            raise ValueError(
+                f"DFlash target max_model_len={target_max_model_len} plus "
+                f"{lookahead} lookahead positions exceeds the drafter's "
+                f"context capacity {draft_max_model_len}. Lower "
+                f"--max-model-len to at most {draft_max_model_len - lookahead} "
+                "or select a drafter configured for the requested context. "
+                "The drafter's positional configuration is not extended "
+                "automatically."
+            )
+
+    @staticmethod
     def _maybe_override_draft_max_model_len(
         speculative_max_model_len: int | None,
         draft_max_model_len: int,

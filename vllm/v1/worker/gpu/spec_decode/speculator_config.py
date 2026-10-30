@@ -238,6 +238,13 @@ class DraftModelSpeculatorConfig(SpeculatorConfig):
                 spec.target_parallel_config, spec.draft_decode_context_parallel_size
             )
         )
+        if spec.method == "dflash":
+            SpeculativeConfig._validate_dflash_context_capacity(
+                target.max_model_len,
+                spec.draft_model_config.max_model_len,
+                spec.num_speculative_tokens,
+            )
+
         spec.draft_model_config.max_model_len = (
             SpeculativeConfig._maybe_override_draft_max_model_len(
                 spec.max_model_len,
