@@ -890,6 +890,18 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         if self.speculative_config is not None:
             logger.info_once("GDN spec decode kernel: %s", self.gdn_decode_kernel)
 
+        # Pad 2-4 token batches of the bf16 in_proj_ba GEMM to 5 rows (see
+        # gdn_ba_proj below). Only the plain unquantized, bias-free projection.
+        self.ba_proj_pad_small_m = (
+            envs.VLLM_GDN_BA_PAD_SMALL_M
+            # LoRA replaces in_proj_ba after construction. Calling F.linear on
+            # its base weight would silently omit the adapter contribution.
+            and vllm_config.lora_config is None
+            and current_platform.is_cuda()
+            and isinstance(self.in_proj_ba.quant_method, UnquantizedLinearMethod)
+            and self.in_proj_ba.bias is None
+        )
+
         compilation_config = get_current_vllm_config().compilation_config
         if prefix in compilation_config.static_forward_context:
             raise ValueError(f"Duplicate layer name: {prefix}")
@@ -1311,9 +1323,16 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         # Part 1: Input Projection
         # ============================================================
         qkvz_in = hidden_states if qkvz_input is None else qkvz_input
+
+        def _ba() -> torch.Tensor:
+            # gdn-ba-pad-small-m: 2-4 token batches of the bf16 ba GEMM padded to 5 rows.
+            if self.ba_proj_pad_small_m:
+                return torch.ops.vllm.gdn_ba_proj(hidden_states, self.in_proj_ba.weight)
+            return self.in_proj_ba(hidden_states)[0]
+
         if self._ba_stream is None:
             mixed_qkvz, _ = self.in_proj_qkvz(qkvz_in)
-            ba, _ = self.in_proj_ba(hidden_states)
+            ba = _ba()
         else:
             # Hide the tiny ba GEMM on the aux stream. Only under CUDA graph
             # capture: eagerly the stream switch costs more host time than it
@@ -1322,7 +1341,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             start, done = self._ba_events
             mixed_qkvz, (ba,) = execute_in_parallel(
                 lambda: self.in_proj_qkvz(qkvz_in)[0],
-                [lambda: self.in_proj_ba(hidden_states)[0]],
+                [_ba],
                 start,
                 [done],
                 [self._ba_stream],
@@ -2587,4 +2606,31 @@ direct_register_custom_op(
     op_name="qwen_gdn_attention_core_fused_norm_packed",
     op_func=qwen_gdn_attention_core_fused_norm_packed,
     mutates_args=["core_attn_out"],
+)
+
+
+def gdn_ba_proj(hidden_states: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    """in_proj_ba (bf16, N = 2 * num_v_heads) with 2-4 token batches padded to 5.
+
+    cuBLAS picks a 16x16 wmma kernel for M = 2..4 at this skinny shape: on an RTX
+    3090 (torch 2.13 / CUDA 13.0) [M, 5120] x [5120, 96] takes 23.8 us at M = 2..4
+    against 3.9 us at M = 1 and 4.9 us at M = 5..8. Speculative verify steps
+    (MTP-3: 4 tokens) sit exactly in that window, 48 GDN layers per step. A custom
+    op so the branch on the batch size stays out of the compiled graph.
+    """
+    num_tokens = hidden_states.size(0)
+    if 2 <= num_tokens <= 4:
+        padded = torch.nn.functional.pad(hidden_states, (0, 0, 0, 5 - num_tokens))
+        return torch.nn.functional.linear(padded, weight)[:num_tokens]
+    return torch.nn.functional.linear(hidden_states, weight)
+
+
+def gdn_ba_proj_fake(hidden_states: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    return hidden_states.new_empty((hidden_states.size(0), weight.size(0)))
+
+
+direct_register_custom_op(
+    op_name="gdn_ba_proj",
+    op_func=gdn_ba_proj,
+    fake_impl=gdn_ba_proj_fake,
 )
