@@ -1085,8 +1085,15 @@ class MambaSpec(KVCacheSpec):
 
     def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
         if vllm_config.cache_config.mamba_cache_mode == "align":
+            # Retirement follows processed tokens. Each queued batch can keep
+            # a state live while the next batch allocates its destination.
+            # Single-batch execution needs two states; async depth two needs
+            # three. Speculative scratch and internal checkpoints are separate.
+            state_blocks = 1 + vllm_config.max_concurrent_batches
             return self.page_size_bytes * (
-                2 + self.num_speculative_blocks + self.num_prefill_checkpoint_blocks
+                state_blocks
+                + self.num_speculative_blocks
+                + self.num_prefill_checkpoint_blocks
             )
         else:
             return self.page_size_bytes * (1 + self.num_speculative_blocks)
@@ -1096,8 +1103,8 @@ class MambaSpec(KVCacheSpec):
         # no CP scaling applies.
         if vllm_config.cache_config.mamba_cache_mode == "align":
             # Block table rows are position-indexed over the full sequence
-            # even though only 2 + num_speculative_blocks state blocks are
-            # resident at a time (earlier states are nulled out by
+            # even though only a bounded set of in-flight state and
+            # speculative scratch blocks is resident (older states are nulled by
             # remove_skipped_blocks), so the row length must cover max_len
             # rather than max_memory_usage_bytes.
             return cdiv(max_len, self.block_size) + self.num_speculative_blocks

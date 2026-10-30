@@ -1131,9 +1131,9 @@ def check_enough_kv_cache_memory(
         )
         _check_enough_kv_cache_memory(
             check_memory,
-            lambda: max_memory_usage_bytes(vllm_config, kv_cache_spec.values()),
+            lambda: _max_memory_usage_bytes_from_groups(vllm_config, groups),
             vllm_config.model_config.max_model_len,
-            lambda am: estimate_max_model_len(vllm_config, kv_cache_spec, am),
+            lambda am: _estimate_max_model_len_from_groups(vllm_config, groups, am),
         )
 
 
@@ -1218,7 +1218,10 @@ def get_max_concurrency_for_kv_cache_config(
             host_blocks_per_request += required
         else:
             num_blocks_per_request += required
-    limits = [kv_cache_config.num_blocks / num_blocks_per_request]
+    # BlockPool permanently removes one physical block as its null block.
+    # Admission/auto-fit already reserve its bytes; report the same usable pool.
+    usable_blocks = max(0, kv_cache_config.num_blocks - 1)
+    limits = [usable_blocks / num_blocks_per_request]
     if host_blocks_per_request:
         assert kv_cache_config.hisparse_host_num_blocks is not None
         limits.append(
