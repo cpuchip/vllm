@@ -132,6 +132,7 @@ if TYPE_CHECKING:
     VLLM_USE_HW_AGNOSTIC: bool = False
     VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE: bool = True
     VLLM_GDN_DECODE_KERNEL: Literal["cuda", "triton"] = "cuda"
+    VLLM_GDN_BA_PAD_SMALL_M: bool = True
     VLLM_DISABLE_PYNCCL: bool = False
     VLLM_USE_OINK_OPS: bool = False
     VLLM_MXFP4_EMULATION_DEQUANT_AT_LOAD: bool = False
@@ -1306,6 +1307,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "cuda",
         ["cuda", "triton"],
         case_sensitive=False,
+    ),
+    # Pad 2-4 token batches of the GDN in_proj_ba GEMM to 5 rows, stepping
+    # around a cuBLAS kernel-selection cliff at that shape (speculative verify).
+    "VLLM_GDN_BA_PAD_SMALL_M": lambda: bool(
+        int(os.getenv("VLLM_GDN_BA_PAD_SMALL_M", "1"))
     ),
     # Disable pynccl (using torch.distributed instead)
     "VLLM_DISABLE_PYNCCL": lambda: (
