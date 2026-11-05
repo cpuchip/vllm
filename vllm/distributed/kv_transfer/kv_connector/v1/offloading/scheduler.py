@@ -39,6 +39,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
     MambaSpec,
     SlidingWindowSpec,
+    get_mamba_prefill_checkpoint_position,
 )
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 from vllm.v1.kv_offload.base import (
@@ -626,6 +627,10 @@ class OffloadingConnectorScheduler:
         self._lookup_groups = self._full_attention_groups + self._sliding_window_groups
         self._mamba_align_size: int | None = resolve_mamba_align_size(
             spec, kv_cache_config
+        )
+        self._use_eagle_block_drop = (
+            vllm_config.speculative_config is not None
+            and vllm_config.speculative_config.use_eagle_block_drop()
         )
         self._partial_tail_block_size = (
             self.config.kv_group_configs[0].tokens_per_block
@@ -1596,6 +1601,26 @@ class OffloadingConnectorScheduler:
             return None
         return alignment_tokens // group_config.tokens_per_block
 
+    def _store_reachable_boundaries(self, request: Request) -> tuple[int, ...]:
+        if self.config.retention_interval is None:
+            return ()
+        boundaries = [request.num_prompt_tokens - 1]
+        if self._mamba_align_size is not None:
+            # Mamba may only resume before the prompt's final hash boundary,
+            # especially after EAGLE's proof-block drop. SWA must retain the
+            # window at that earlier state too; the final prompt window alone
+            # can omit its leftmost chunk even while the CPU tier retains A.
+            checkpoint = get_mamba_prefill_checkpoint_position(
+                request.num_prompt_tokens,
+                self._mamba_align_size,
+                self._use_eagle_block_drop,
+            )
+            if checkpoint > 0:
+                boundaries.append(checkpoint)
+        if request.shared_prefix_boundary:
+            boundaries.append(request.shared_prefix_boundary)
+        return tuple(dict.fromkeys(boundaries))
+
     def _build_store_jobs(
         self,
         scheduler_output: SchedulerOutput,
@@ -1634,11 +1659,7 @@ class OffloadingConnectorScheduler:
             new_offload_keys: list[OffloadKey] = []
             group_store_ranges: list[tuple[int, int]] = []
 
-            reachable_boundaries: tuple[int, ...] = ()
-            if self.config.retention_interval is not None:
-                reachable_boundaries = (req.num_prompt_tokens - 1,)
-                if req.shared_prefix_boundary:
-                    reachable_boundaries += (req.shared_prefix_boundary,)
+            reachable_boundaries = self._store_reachable_boundaries(req)
 
             for group_config, group_state in zip(
                 self.config.kv_group_configs, req_status.group_states
