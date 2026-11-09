@@ -257,6 +257,7 @@ if TYPE_CHECKING:
     VLLM_HUMMING_MOE_GEMM_TYPE: Literal["indexed", "grouped", "auto"] | None = None
     VLLM_B12X_MOE_FP4_FORCE_A16: bool = False
     VLLM_DEEPEPLL_NVFP4_DISPATCH: bool = False
+    VLLM_DFLASH2_RESIDUAL_SCALE: str = ""
     VLLM_V1_USE_OUTLINES_CACHE: bool = False
     VLLM_TPU_USING_PATHWAYS: bool = False
     VLLM_USE_DEEP_GEMM: bool = True
@@ -1717,6 +1718,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_VISION_CPU_OFFLOAD_GB": lambda: float(
         os.environ.get("VLLM_VISION_CPU_OFFLOAD_GB", "0")
     ),
+    "VLLM_DFLASH2_RESIDUAL_SCALE": lambda: os.environ.get("VLLM_DFLASH2_RESIDUAL_SCALE", ""),
     # The activation dtype config for humming kernel. Explicit schemas disable
     # fallback unless the config includes "allow_fallback": true.
     "VLLM_HUMMING_INPUT_QUANT_CONFIG": lambda: maybe_convert_json_str_or_file(
