@@ -256,6 +256,7 @@ if TYPE_CHECKING:
     VLLM_HUMMING_MOE_GEMM_TYPE: Literal["indexed", "grouped", "auto"] | None = None
     VLLM_B12X_MOE_FP4_FORCE_A16: bool = False
     VLLM_DEEPEPLL_NVFP4_DISPATCH: bool = False
+    VLLM_TERMINAL_PROGRESS: bool = False
     VLLM_GDN_SM75: bool = False
     VLLM_FLASHINFER_NATIVE_SPEC_GRAPHS: bool = False
     VLLM_FLASHINFER_SM75: bool = False
@@ -1717,6 +1718,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_VISION_CPU_OFFLOAD_GB": lambda: float(
         os.environ.get("VLLM_VISION_CPU_OFFLOAD_GB", "0")
     ),
+    "VLLM_TERMINAL_PROGRESS": lambda: os.environ.get("VLLM_TERMINAL_PROGRESS", "0") == "1",
     "VLLM_GDN_SM75": lambda: os.environ.get("VLLM_GDN_SM75", "0") == "1",
     "VLLM_FLASHINFER_NATIVE_SPEC_GRAPHS": lambda: os.environ.get("VLLM_FLASHINFER_NATIVE_SPEC_GRAPHS", "0") == "1",
     "VLLM_FLASHINFER_SM75": lambda: os.environ.get("VLLM_FLASHINFER_SM75", "0") == "1",
@@ -2522,6 +2524,8 @@ def compile_factors() -> dict[str, object]:
         "VLLM_RINGBUFFER_WARNING_INTERVAL",
         "VLLM_DEBUG_DUMP_PATH",
         "VLLM_PORT",
+        # Per-request console progress (logging only), patches/terminal-request-progress.patch.
+        "VLLM_TERMINAL_PROGRESS",
         "VLLM_CACHE_ROOT",
         # Runtime memory-plan persistence; does not affect compiled graphs.
         "VLLM_ENABLE_STARTUP_PLAN",
