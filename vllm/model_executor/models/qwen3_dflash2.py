@@ -5,6 +5,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from vllm import envs
 from vllm.compilation.backends import set_model_tag
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
@@ -271,6 +272,16 @@ class DFlash2Qwen3DecoderLayer(DFlashQwen3DecoderLayer):
         self.mlp_conv = DFlashGroupedConv(
             **conv_args, prefix=maybe_prefix(prefix, "mlp_conv")
         )
+        # fp16 headroom (sm75 / Turing): the drafter is trained in bf16 and its residual
+        # stream reaches ~6e4 by layer 2, past fp16's 65504, so every draft after that is
+        # NaN (measured: 1/434 drafts accepted). Every norm here is a pre-norm RMSNorm,
+        # which is invariant to a common scale on the residual, so carry the residual at
+        # 1/32 scale: the normed activations and the final norm's output are unchanged.
+        # VLLM_DFLASH2_RESIDUAL_SCALE overrides (1 disables); bf16 defaults to 1.
+        _default = 1.0 / 32 if vllm_config.model_config.dtype == torch.float16 else 1.0
+        self.residual_scale = float(
+            envs.VLLM_DFLASH2_RESIDUAL_SCALE or _default
+        )
 
     def forward(
         self,
@@ -280,17 +291,23 @@ class DFlash2Qwen3DecoderLayer(DFlashQwen3DecoderLayer):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if residual is None:
             residual = hidden_states
+            if self.residual_scale != 1.0:
+                residual = residual * self.residual_scale
             hidden_states = self.input_layernorm(hidden_states)
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
         hidden_states, coefficients = self.attention_conv.prepare(hidden_states)
         hidden_states = self.self_attn(positions=positions, hidden_states=hidden_states)
+        if self.residual_scale != 1.0:
+            hidden_states = hidden_states * self.residual_scale
         hidden_states = self.attention_conv.finish(hidden_states, coefficients)
 
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         hidden_states, coefficients = self.mlp_conv.prepare(hidden_states)
         hidden_states = self.mlp(hidden_states)
+        if self.residual_scale != 1.0:
+            hidden_states = hidden_states * self.residual_scale
         hidden_states = self.mlp_conv.finish(hidden_states, coefficients)
         return hidden_states, residual
 
