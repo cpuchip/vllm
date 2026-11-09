@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+from vllm.v1.metrics import terminal_progress
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
@@ -1616,6 +1617,10 @@ class Scheduler(SchedulerInterface):
                     request.record_event(
                         EngineCoreEventType.SCHEDULED, scheduled_timestamp
                     )
+                if terminal_progress.ENABLED:
+                    terminal_progress.reading(
+                        request, num_computed_tokens, start=scheduled_timestamp
+                    )
                 # A resumed request is re-sent in full, like a new one: its
                 # blocks were freed and its worker state dropped at preemption.
                 if request.status not in (
@@ -2433,6 +2438,13 @@ class Scheduler(SchedulerInterface):
             # Free encoder inputs only after the step has actually executed.
             if request.has_encoder_inputs:
                 self._free_encoder_inputs(request)
+
+            if terminal_progress.ENABLED and not request.output_token_ids and not output_is_stale:
+                # Async scheduling includes future chunks in num_computed_tokens.
+                # Subtract in-flight work to display only completed prompt tokens.
+                terminal_progress.reading(
+                    request, request.num_computed_tokens - request.num_in_flight_tokens
+                )
 
             stopped = False
             new_logprobs = None

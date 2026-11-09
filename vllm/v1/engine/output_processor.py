@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import asyncio
+from vllm.v1.metrics import terminal_progress
 from collections import defaultdict, deque
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -237,6 +238,8 @@ class RequestState:
         self.spec_decode_metrics: RequestSpecDecodeMetrics | None = None
 
         self.stats = RequestStateStats(arrival_time=arrival_time) if log_stats else None
+        if terminal_progress.ENABLED:
+            self._terminal_arrival = arrival_time
 
         # Routed experts accumulation (prompt + sample chunks)
         self.routed_experts_chunks: list[np.ndarray] = []
@@ -640,6 +643,8 @@ class OutputProcessor:
         for request_id in internal_req_ids:
             req_state = self.request_states.pop(request_id, None)
             if req_state is not None:
+                if terminal_progress.ENABLED:
+                    terminal_progress.output(req_state, None, cancelled=True)
                 self.lora_states.request_finished(request_id, req_state.lora_name)
                 request_ids_to_abort.append(request_id)
                 # Produce final abort output.
@@ -853,6 +858,8 @@ class OutputProcessor:
             streaming_chunk_boundary = req_state.streaming_input and (
                 finish_reason not in (FinishReason.ABORT, FinishReason.ERROR)
             )
+            if terminal_progress.ENABLED and pooling_output is None:
+                terminal_progress.output(req_state, engine_core_timestamp, finish_reason)
 
             # 4) Create and handle RequestOutput objects.
             if request_output := req_state.make_request_output(
