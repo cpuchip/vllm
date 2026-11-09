@@ -399,6 +399,14 @@ class ChunkGatedDeltaRule(CustomOp):
         else:
             self._forward_method = self.forward_native
 
+        if envs.VLLM_GDN_SM75 and current_platform.is_device_capability(75):
+            from vllm.model_executor.layers.mamba.ops.sm75_gdn import (
+                chunk_gated_delta_rule, load_extension,
+            )
+            load_extension()  # Compile before any CUDA graph capture.
+            self._forward_method = chunk_gated_delta_rule
+            logger.info_once("Using opt-in SM75 CUDA recurrent GDN prefill kernel.")
+
     def forward_cuda(
         self,
         q: torch.Tensor,
