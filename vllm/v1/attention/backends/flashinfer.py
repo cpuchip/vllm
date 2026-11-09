@@ -699,9 +699,13 @@ class FlashInferBackend(AttentionBackend):
         # https://github.com/flashinfer-ai/flashinfer/pull/3621). Temporarily
         # raise the floor to SM80 so it is not auto-selected on SM75 until
         # that fix lands; revert to DeviceCapability(7, 5) once it does.
-        return capability >= DeviceCapability(8, 0) and capability <= DeviceCapability(
-            12, 1
+        # VLLM_FLASHINFER_SM75=1 opts Turing back in (explicit --attention-backend only).
+        floor = (
+            DeviceCapability(7, 5)
+            if envs.VLLM_FLASHINFER_SM75
+            else DeviceCapability(8, 0)
         )
+        return capability >= floor and capability <= DeviceCapability(12, 1)
 
     @classmethod
     def supports_sink(cls) -> bool:
