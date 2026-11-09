@@ -889,6 +889,11 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             None  # Wrapper for non-causal prefill (DFlash)
         )
         self._decode_wrapper = None  # Wrapper for decode (general shape)
+        # Separate plans per captured query shape; graph replay retains their
+        # workspaces and metadata addresses. Native FA2 supports both causal
+        # target verification and noncausal DFlash query attention.
+        self._native_prefill_graph_wrappers = {}
+        self._native_spec_graphs = self._use_native_spec_graphs(vllm_config)
 
         if envs.VLLM_BATCH_INVARIANT:
             self.decode_fixed_split_size = 2048
@@ -1202,6 +1207,19 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             return FlashInferBackend.get_dtype_for_flashinfer("fp8_e4m3")
         return self.kv_cache_spec.dtype
 
+    @staticmethod
+    def _use_native_spec_graphs(vllm_config: VllmConfig) -> bool:
+        spec = vllm_config.speculative_config
+        return (
+            envs.VLLM_FLASHINFER_NATIVE_SPEC_GRAPHS
+            and current_platform.is_device_capability(75)
+            and vllm_config.model_config.dtype == torch.float16
+            and vllm_config.cache_config.cache_dtype in ("auto", "fp8", "fp8_e4m3")
+            and vllm_config.parallel_config.decode_context_parallel_size == 1
+            and spec is not None
+            and not spec.enable_adaptive_verification
+        )
+
     @override  # type: ignore[misc]
     @classmethod
     def get_cudagraph_support(
@@ -1210,6 +1228,8 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         kv_cache_spec: KVCacheSpec,
     ) -> AttentionCGSupport:
         """Get the cudagraph support level for FlashInfer attention."""
+        if cls._use_native_spec_graphs(vllm_config):
+            return AttentionCGSupport.UNIFORM_BATCH
         # XQA lacks LSE for DCP; DCP also cannot graph variable-length trtllm-gen.
         if vllm_config.parallel_config.decode_context_parallel_size > 1:
             return AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
@@ -1263,6 +1283,8 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         vllm_config: VllmConfig,
         kv_cache_spec: KVCacheSpec,
     ) -> int | None:
+        if cls._use_native_spec_graphs(vllm_config):
+            return None  # Native FA2 graphs require a fixed uniform query width.
         # The uniform gate already covers DCP, head geometry, the XQA head-dim
         # limit and causality, and yields None for subclasses that force NEVER.
         # The native fa2 decode wrapper takes only uniform query lengths.
@@ -1413,7 +1435,28 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
     def _get_prefill_wrapper(
         self,
         causal: bool = True,
+        graph_shape: tuple[int, int] | None = None,
     ) -> BatchPrefillWithPagedKVCacheWrapper | BatchDCPPrefillWrapper:
+        if graph_shape is not None:
+            assert self._native_spec_graphs and not self.use_dcp and not self.has_sinks
+            num_reqs, num_tokens = graph_shape
+            key = (num_reqs, num_tokens, causal)
+            wrapper = self._native_prefill_graph_wrappers.get(key)
+            if wrapper is None:
+                wrapper = BatchPrefillWithPagedKVCacheWrapper(
+                    self._get_workspace_buffer(),
+                    get_flashinfer_layout_string(self.kv_cache_layout),
+                    use_cuda_graph=True,
+                    qo_indptr_buf=torch.empty(
+                        num_reqs + 1, dtype=torch.int32, device=self.device
+                    ),
+                    paged_kv_indptr_buf=self.paged_kv_indptr.gpu[:num_reqs + 1],
+                    paged_kv_indices_buf=self.paged_kv_indices,
+                    paged_kv_last_page_len_buf=self.paged_kv_last_page_len.gpu[:num_reqs],
+                    backend="fa2",
+                )
+                self._native_prefill_graph_wrappers[key] = wrapper
+            return wrapper
         if not causal:
             if self.use_dcp:
                 raise NotImplementedError(
@@ -1838,7 +1881,18 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                     max_seq_len=max_seq_len,
                 )
             else:
-                prefill_wrapper = self._get_prefill_wrapper(causal=attn_metadata.causal)
+                graph_shape = None
+                if (
+                    self._native_spec_graphs
+                    and self.enable_cuda_graph
+                    and num_decodes == 0
+                    and num_prefill_tokens <= self._decode_cudagraph_max_bs
+                    and common_attn_metadata.max_query_len <= self._num_speculative_tokens + 1
+                ):
+                    graph_shape = (num_prefills, num_prefill_tokens)
+                prefill_wrapper = self._get_prefill_wrapper(
+                    causal=attn_metadata.causal, graph_shape=graph_shape
+                )
                 # Slicing CPU buffers that are only needed for FI native prefills
                 paged_kv_last_page_len_prefill_cpu = self.paged_kv_last_page_len.cpu[
                     prefill_start:num_reqs
