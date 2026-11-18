@@ -47,6 +47,7 @@ from vllm.v1.kv_cache_interface import (
     SlidingWindowMLASpec,
     SlidingWindowSpec,
     get_mamba_prefill_checkpoint_position,
+    get_mamba_periodic_prefill_checkpoints,
     is_mamba_prefill_checkpoint_valid,
 )
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
@@ -1499,6 +1500,7 @@ class MambaManager(SingleTypeKVCacheManager):
             # checkpoint position and reserved block index for the current
             # allocation.
             self._checkpoints: dict[str, tuple[int, int]] = {}
+            self._periodic_checkpoints: dict[str, list[int]] = {}
             # Requests that registered their own last-prompt-boundary partial
             # tail (producers). A later CoW hands its private copy to the
             # connector; a request that finishes first hands off this table
@@ -1744,7 +1746,13 @@ class MambaManager(SingleTypeKVCacheManager):
         blocks = self.req_to_blocks[request_id]
         return (
             self.has_prefill_checkpoint_blocks
-            and query_end >= prefill_end
+            and (
+                query_end >= prefill_end
+                or (
+                    self.kv_cache_spec.prefill_checkpoint_interval
+                    and query_start < prefill_end
+                )
+            )
             and is_mamba_prefill_checkpoint_valid(
                 query_start=query_start,
                 query_end=query_end,
@@ -1831,8 +1839,9 @@ class MambaManager(SingleTypeKVCacheManager):
             # Keyed on the chunk end like the worker's
             # `compute_mamba_prefill_checkpoints`, which writes the state there.
             # The helper returns a boundary strictly below its input, so every
-            # chunk has one; under sparse retention only the prefill-end chunk's
-            # is kept, so `prefill_end` skips reserving blocks for the others.
+            # chunk has one; the upstream path can skip non-final chunks under
+            # sparse retention. Periodic exporters also reserve intermediate
+            # chunks, using the actual prefill end supplied by the coordinator.
             checkpoint_position = get_mamba_prefill_checkpoint_position(
                 num_tokens,
                 self.cache_hit_alignment_tokens,
@@ -1848,9 +1857,24 @@ class MambaManager(SingleTypeKVCacheManager):
             ):
                 checkpoint_position = 0
             checkpoint_block = int(checkpoint_position > 0)
+            checkpoint_idx = (
+                cdiv(num_tokens, self.block_size) - 2 if checkpoint_block else -1
+            )
+            periodic = []
+            if total_computed_tokens < prefill_end:
+                periodic = get_mamba_periodic_prefill_checkpoints(
+                    total_computed_tokens,
+                    num_tokens,
+                    self.kv_cache_spec.prefill_checkpoint_interval,
+                    self.block_size,
+                    self.block_pool.hash_block_size,
+                    self.kv_cache_spec.prefill_checkpoint_alignment,
+                    checkpoint_idx,
+                    checkpoint_position,
+                )
             if not apply_admission_cap:
+                self._periodic_checkpoints[request_id] = [col for _, col in periodic]
                 if checkpoint_position > 0:
-                    checkpoint_idx = cdiv(num_tokens, self.block_size) - 2
                     self._checkpoints[request_id] = (
                         checkpoint_position,
                         checkpoint_idx,
@@ -1867,7 +1891,13 @@ class MambaManager(SingleTypeKVCacheManager):
             num_evictable_computed_blocks = self._get_num_evictable_blocks(
                 new_computed_blocks
             )
-            return num_new_blocks + num_evictable_computed_blocks
+            periodic_count = len(periodic)
+            if apply_admission_cap:
+                periodic_count = min(
+                    periodic_count,
+                    max(0, self.kv_cache_spec.num_prefill_checkpoint_blocks - 1),
+                )
+            return num_new_blocks + periodic_count + num_evictable_computed_blocks
 
     def allocate_new_blocks(
         self, request_id: str, num_tokens: int, num_tokens_main_model: int
@@ -1895,6 +1925,7 @@ class MambaManager(SingleTypeKVCacheManager):
                 cdiv(num_tokens, self.block_size) + self.num_speculative_blocks
             )
             checkpoint_block = int(request_id in self._checkpoints)
+            periodic_cols = self._periodic_checkpoints.get(request_id, [])
             partial_hit = self._partial_hit_reqs.get(request_id)
             has_partial_hit = partial_hit is not None
             # `num_required_blocks` might be less than `len(req_blocks)` if blocks are
@@ -1903,6 +1934,7 @@ class MambaManager(SingleTypeKVCacheManager):
                 num_required_blocks <= len(req_blocks)
                 and not has_partial_hit
                 and not checkpoint_block
+                and not periodic_cols
             ):
                 self._allocated_block_reqs.add(request_id)
                 return []
@@ -1940,6 +1972,15 @@ class MambaManager(SingleTypeKVCacheManager):
                     for block_idx in range(
                         prev_block_len - self.num_speculative_blocks, prev_block_len
                     ):
+                        if block_idx in periodic_cols:
+                            # Its physical column is already known to the
+                            # worker. Keep this exclusively owned scratch slot
+                            # in place for export, and replace the moved tail's
+                            # missing scratch with a fresh page below.
+                            assert self.block_pool.is_block_writable(
+                                req_blocks[block_idx]
+                            )
+                            continue
                         if block_idx < num_skipped_blocks - checkpoint_block:
                             self._relocate_speculative_block(req_blocks, block_idx)
                         else:
@@ -1947,11 +1988,22 @@ class MambaManager(SingleTypeKVCacheManager):
                 num_new_blocks = max(num_required_blocks - len(req_blocks), 0)
                 if has_partial_hit:
                     num_new_blocks = max(num_new_blocks, 0) + 1
-                max_new_blocks = 1 + int(has_partial_hit) + checkpoint_block
+                missing_periodic = [
+                    col for col in periodic_cols if req_blocks[col].is_null
+                ]
+                num_new_blocks += len(missing_periodic)
+                max_new_blocks = (
+                    1 + int(has_partial_hit) + checkpoint_block + len(periodic_cols)
+                )
                 if not blocks_allocated:
                     max_new_blocks += self.num_speculative_blocks
                 assert num_new_blocks <= max_new_blocks
                 new_blocks = self.block_pool.get_new_blocks(num_new_blocks)
+                if missing_periodic:
+                    periodic_blocks = new_blocks[-len(missing_periodic) :]
+                    new_blocks = new_blocks[: -len(missing_periodic)]
+                    for col, block in zip(missing_periodic, periodic_blocks):
+                        req_blocks[col] = block
                 returned_blocks = req_blocks[prev_block_len:]
                 if partial_hit is not None:
                     block_idx, source_block = partial_hit
@@ -1988,10 +2040,7 @@ class MambaManager(SingleTypeKVCacheManager):
                             # The moved entry is only filled by this step's
                             # copy, so defer same-step hits on it.
                             self.cached_blocks_this_step.add(cow_block.block_hash)
-                        if (
-                            _KEEP_ALIGN_CHECKPOINTS
-                            and cow_block.block_hash is not None
-                        ):
+                        if _KEEP_ALIGN_CHECKPOINTS and cow_block.block_hash is not None:
                             # This block now carries the chain's reachable
                             # boundary state — the one snapshot the NEXT turn's
                             # hit resumes from. Releasing it right after the
@@ -2062,6 +2111,7 @@ class MambaManager(SingleTypeKVCacheManager):
             self.last_state_block_idx.pop(request_id, None)
             self._num_retired_blocks.pop(request_id, None)
             self._checkpoints.pop(request_id, None)
+            self._periodic_checkpoints.pop(request_id, None)
             self._producer_partial_tail_reqs.pop(request_id, None)
             # An offer is only guaranteed to hold committed bytes until the end
             # of the pass that made it. This request's blocks are going back to
