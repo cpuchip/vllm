@@ -894,6 +894,9 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         # target verification and noncausal DFlash query attention.
         self._native_prefill_graph_wrappers = {}
         self._native_spec_graphs = self._use_native_spec_graphs(vllm_config)
+        # plan() fills the wrapper's page-locked buffer and copies it to the
+        # GPU asynchronously, so it must not run again before that copy has.
+        self._plan_copied = torch.cuda.Event(blocking=True)
 
         if envs.VLLM_BATCH_INVARIANT:
             self.decode_fixed_split_size = 2048
@@ -1804,6 +1807,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 num_reqs,
                 page_size,
             )
+            self._plan_copied.synchronize()
         else:
             paged_kv_indices = None
 
@@ -2090,6 +2094,8 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                     q_len_per_req=q_len_per_req,
                 )
                 attn_metadata.decode = FIDecode(wrapper=decode_wrapper)
+        if needs_paged_kv_indices:
+            self._plan_copied.record()
         return attn_metadata
 
     def update_draft_decode_metadata(self, _metadata: FlashInferMetadata) -> None:
