@@ -91,6 +91,23 @@ class GDNAttentionBackend(AttentionBackend):
 
 
 @dataclass
+class GDNPrefillCheckpointPlan:
+    # All Python values are derived from CPU scheduling metadata, once per step.
+    source_slices: list[tuple[int, int]]
+    conv_source_starts: list[int]
+    prefill_rows: torch.Tensor
+    non_spec_rows: torch.Tensor
+    state_indices: torch.Tensor
+    query_start_loc: torch.Tensor
+    chunk_indices: torch.Tensor | None
+    chunk_offsets: torch.Tensor | None
+    # Split duplicated prefixes into bounded FLA calls. A single prefill with
+    # many checkpoints must not concatenate O(query_length ** 2) tokens into
+    # one temporary allocation on every layer.
+    export_batches: list["GDNPrefillCheckpointPlan"] | None = None
+
+
+@dataclass
 class GDNAttentionMetadata:
     num_prefills: int
     num_prefill_tokens: int
@@ -102,6 +119,7 @@ class GDNAttentionMetadata:
 
     checkpoint: MambaPrefillCheckpointMetadata | None = None
     flashinfer_checkpoint_plan: GDNFlashInferCheckpointPlan | None = None
+    checkpoint_plan: GDNPrefillCheckpointPlan | None = None
     has_initial_state: torch.Tensor | None = None
 
     spec_query_start_loc: torch.Tensor | None = None  # shape: [num_spec_decodes + 1,]
@@ -203,6 +221,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             device.type in ("cuda", "xpu")
             # Not isinstance: KDA's RecoverSSM/checkpoint metadata is per group.
             and type(self) is GDNAttentionMetadataBuilder
+            and kv_cache_spec.num_prefill_checkpoint_blocks == 0
         )
         if self.supports_update_block_table:
             # Opts into MRV2's aligned-index precompute.
@@ -325,6 +344,77 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 device=device,
             ),
         )
+
+    def _build_checkpoint_plan(
+        self,
+        checkpoint: MambaPrefillCheckpointMetadata,
+        num_decodes: int,
+        num_decode_tokens: int,
+        non_spec_query_start_loc_cpu: torch.Tensor,
+        device: torch.device,
+    ) -> GDNPrefillCheckpointPlan | None:
+        offsets = checkpoint.offsets
+        assert offsets is not None
+        # Geometry alone is not an allocation acknowledgement. The scheduler
+        # can decline geometrically valid positions and represent them with
+        # the null block. Read the small list
+        # once per metadata build; never write into the shared null state.
+        destinations = checkpoint.state_indices.cpu().tolist()
+        source_rows = checkpoint.source_rows
+        if source_rows is None:
+            source_rows = list(range(len(offsets)))
+        selected = [
+            i
+            for i, offset in enumerate(offsets)
+            if source_rows[i] >= num_decodes
+            and offset > 0
+            and destinations[i] != NULL_BLOCK_ID
+        ]
+        if not selected:
+            return None
+        starts = non_spec_query_start_loc_cpu.tolist()
+
+        def assemble(entries_cpu):
+            lengths = [offsets[i] for i in entries_cpu]
+            cu_cpu = torch.tensor(
+                [0, *torch.tensor(lengths).cumsum(0).tolist()], dtype=torch.int32
+            )
+            cu = async_tensor_h2d(cu_cpu.tolist(), dtype=torch.int32, device=device)
+            ci, co = self._build_chunk_metadata(cu, cu_cpu, device)
+            rows = async_tensor_h2d(
+                [source_rows[i] for i in entries_cpu], dtype=torch.int64, device=device
+            )
+            entries = async_tensor_h2d(entries_cpu, dtype=torch.int64, device=device)
+            return GDNPrefillCheckpointPlan(
+                source_slices=[
+                    (starts[source_rows[i]] - num_decode_tokens, offsets[i])
+                    for i in entries_cpu
+                ],
+                conv_source_starts=[starts[source_rows[i]] for i in entries_cpu],
+                prefill_rows=rows - num_decodes,
+                non_spec_rows=rows,
+                state_indices=checkpoint.state_indices.index_select(0, entries).to(
+                    torch.int64
+                ),
+                query_start_loc=cu,
+                chunk_indices=ci,
+                chunk_offsets=co,
+            )
+
+        plan = assemble(selected)
+        budget = starts[-1] - num_decode_tokens
+        batches, batch, tokens = [], [], 0
+        for entry in selected:
+            length = offsets[entry]
+            if batch and tokens + length > budget:
+                batches.append(batch)
+                batch, tokens = [], 0
+            batch.append(entry)
+            tokens += length
+        batches.append(batch)
+        if len(batches) > 1:
+            plan.export_batches = [assemble(batch) for batch in batches]
+        return plan
 
     def build(  # type: ignore[override]
         self,
@@ -617,6 +707,15 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 rows=plan[len(cu_starts) :],
             )
 
+        checkpoint_plan = None
+        if (checkpoint is not None and self.gdn_prefill_backend == "triton"
+                and type(self) is GDNAttentionMetadataBuilder):
+            assert non_spec_query_start_loc_cpu is not None
+            checkpoint_plan = self._build_checkpoint_plan(
+                checkpoint, num_decodes, num_decode_tokens,
+                non_spec_query_start_loc_cpu, query_start_loc.device,
+            )
+
         # Function code counted on either presency non-spec decode or spec decode,
         # but not both.
         assert not (num_decodes > 0 and num_spec_decodes > 0), (
@@ -696,6 +795,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             num_actual_tokens=m.num_actual_tokens,
             checkpoint=checkpoint,
             flashinfer_checkpoint_plan=flashinfer_checkpoint_plan,
+            checkpoint_plan=checkpoint_plan,
             has_initial_state=has_initial_state,
             chunk_indices=chunk_indices,
             chunk_offsets=chunk_offsets,

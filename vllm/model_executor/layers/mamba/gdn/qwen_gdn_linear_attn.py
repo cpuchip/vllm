@@ -27,6 +27,7 @@ from vllm.distributed import (
 )
 from vllm.forward_context import ForwardContext, get_forward_context
 from vllm.logger import init_logger
+from vllm.v1.kv_cache_interface import MambaSpec
 from vllm.model_executor.custom_op import CustomOp, PluggableLayer
 from vllm.model_executor.layers.fusion.quant_activation import QuantizedActivation
 from vllm.model_executor.layers.layernorm import RMSNormGated
@@ -912,6 +913,42 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec | None:
         spec = super().get_kv_cache_spec(vllm_config)
+        if envs.VLLM_GDN_PREFILL_CHECKPOINTS and isinstance(spec, MambaSpec):
+            if vllm_config.cache_config.mamba_cache_mode != "align":
+                raise RuntimeError(
+                    "GDN prefill checkpoints require mamba_cache_mode=align"
+                )
+            # Only the tested CUDA Triton/FLA prefill path exports checkpoints.
+            # Unsupported paths must not reserve blocks they cannot write.
+            if (
+                not current_platform.is_cuda()
+                or _resolve_gdn_prefill_backend(vllm_config)[1] != "triton"
+            ):
+                raise RuntimeError(
+                    "GDN prefill checkpoints require the CUDA Triton/FLA "
+                    "prefill backend. Select gdn_prefill_backend=triton."
+                )
+            interval = vllm_config.cache_config.prefix_cache_retention_interval
+            if interval == 0:
+                raise RuntimeError(
+                    "GDN periodic prefill checkpoints require dense retention "
+                    "(prefix_cache_retention_interval=None) or a positive interval"
+                )
+            interval = interval or spec.block_size
+            if interval % spec.block_size:
+                raise RuntimeError(
+                    "GDN checkpoint interval must be a multiple of mamba_block_size"
+                )
+            # At most ceil(batch/interval) periodic destinations plus the final
+            # hash checkpoint. Budget each in-flight batch in MambaSpec.
+            max_tokens = vllm_config.scheduler_config.max_num_batched_tokens
+            return replace(
+                spec,
+                num_prefill_checkpoint_blocks=(max_tokens + interval - 1) // interval
+                + 1,
+                prefill_checkpoint_alignment=1,
+                prefill_checkpoint_interval=interval,
+            )
         if not self._exports_checkpoints or not isinstance(spec, MambaSpec):
             return spec
         # FlashInfer emits states at one stride for the whole batch, the gcd of
@@ -1248,6 +1285,86 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         value = v_contig.view(1, seq_len, -1, self.head_v_dim)
 
         return query, key, value
+
+    def _store_gdn_checkpoint_conv(
+        self,
+        attn_metadata,
+        raw_qkv: torch.Tensor,
+        conv_state: torch.Tensor,
+    ) -> None:
+        """Save the exact pre-convolution history before normal cache updates."""
+        plan = attn_metadata.checkpoint_plan
+        if plan is None:
+            return
+        width = self.conv_kernel_size - 1
+        for i, ((_, length), start) in enumerate(
+            zip(plan.source_slices, plan.conv_source_starts)
+        ):
+            dst = plan.state_indices[i : i + 1]
+            history = raw_qkv[start : start + length].transpose(0, 1)
+            if length < width:
+                rows = plan.non_spec_rows[i : i + 1]
+                src = attn_metadata.non_spec_state_indices_tensor.index_select(0, rows)
+                initial = conv_state.index_select(0, src.to(torch.int64))[..., :width]
+                has_initial = attn_metadata.has_initial_state.index_select(0, rows)
+                initial = torch.where(has_initial[:, None, None], initial, 0)
+                history = torch.cat(
+                    (initial.squeeze(0), history.to(initial.dtype)), dim=-1
+                )
+            # Extra speculative slots are scratch, not part of the resumed
+            # convolution history. A fresh request starts at accepted index 1.
+            saved = torch.zeros_like(conv_state.index_select(0, dst))
+            saved[..., :width] = history[..., -width:].to(saved.dtype)
+            conv_state.index_copy_(0, dst, saved)
+
+    def _store_gdn_prefill_checkpoint(
+        self,
+        attn_metadata,
+        initial_state,
+        q,
+        k,
+        v,
+        g,
+        beta,
+        ssm_state,
+    ) -> None:
+        """Recompute selected prefixes; never substitute a full row's end state.
+
+        Convolution is already causal and normalized Q/K/V/g/beta can be
+        cropped directly. Prefix FLA metadata is prepared on the CPU by the
+        builder, so exporting adds no device-to-host synchronization.
+        """
+        plan = attn_metadata.checkpoint_plan
+        if plan is None:
+            return
+
+        for batch in plan.export_batches or [plan]:
+
+            def crop(value):
+                return torch.cat(
+                    [
+                        value[:, start : start + length]
+                        for start, length in batch.source_slices
+                    ],
+                    dim=1,
+                )
+
+            _, checkpoints = self.chunk_gated_delta_rule(
+                q=crop(q),
+                k=crop(k),
+                v=crop(v),
+                g=crop(g),
+                beta=crop(beta),
+                initial_state=initial_state.index_select(0, batch.prefill_rows),
+                output_final_state=True,
+                cu_seqlens=batch.query_start_loc,
+                chunk_indices=batch.chunk_indices,
+                chunk_offsets=batch.chunk_offsets,
+                use_qk_l2norm_in_kernel=False,
+            )
+            ssm_state.index_copy_(
+                0, batch.state_indices, checkpoints.to(ssm_state.dtype)
+            )
 
     def forward(
         self,
@@ -1870,6 +1987,11 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             mixed_qkv_spec = None
             mixed_qkv_non_spec = mixed_qkv
 
+        if attn_metadata.checkpoint_plan is not None:
+            assert mixed_qkv_non_spec is not None
+            self._store_gdn_checkpoint_conv(attn_metadata, mixed_qkv_non_spec,
+                                            conv_state)
+
         # 1.1: Process the multi-query part
         if spec_sequence_masks is not None:
             # spec_state_indices_tensor is always set when spec_sequence_masks is set
@@ -2071,6 +2193,11 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 initial_state = gather_initial_states(
                     ssm_state, prefill_state_indices, prefill_has_initial_state
                 )
+                if self.gdn_prefill_backend == "triton":
+                    self._store_gdn_prefill_checkpoint(
+                        attn_metadata, initial_state, query_non_spec, key_non_spec,
+                        value_non_spec, g_non_spec, beta_non_spec, ssm_state,
+                    )
                 (
                     core_attn_out_non_spec,
                     last_recurrent_state,

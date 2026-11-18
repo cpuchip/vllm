@@ -1139,6 +1139,9 @@ class MambaSpec(KVCacheSpec):
     num_speculative_blocks: int = 0
     num_prefill_checkpoint_blocks: int = 0
     prefill_checkpoint_alignment: int | None = None
+    # Opt-in backends that export several exact states in one prefill. Zero
+    # preserves the upstream single-checkpoint allocation/metadata contract.
+    prefill_checkpoint_interval: int = 0
     num_heads: int = 1
     tokens_per_state: int = -1
     # False: the state is sharded across TP ranks (e.g. GDN). True: every TP
@@ -1186,6 +1189,11 @@ class MambaSpec(KVCacheSpec):
                 state_blocks
                 + self.num_speculative_blocks
                 + self.num_prefill_checkpoint_blocks
+                * (
+                    vllm_config.max_concurrent_batches
+                    if self.prefill_checkpoint_interval
+                    else 1
+                )
             )
         else:
             return self.page_size_bytes * (1 + self.num_speculative_blocks)
@@ -1210,6 +1218,7 @@ class MambaSpec(KVCacheSpec):
             and spec.num_speculative_blocks == self.num_speculative_blocks
             and spec.num_prefill_checkpoint_blocks == self.num_prefill_checkpoint_blocks
             and spec.prefill_checkpoint_alignment == self.prefill_checkpoint_alignment
+            and spec.prefill_checkpoint_interval == self.prefill_checkpoint_interval
             and spec.page_size_bytes == self.page_size_bytes
             and spec.state_alignment == self.state_alignment
             and spec.tp_replicated == self.tp_replicated
@@ -1235,6 +1244,38 @@ def get_mamba_prefill_checkpoint_position(
     if drop_eagle_block:
         checkpoint_position -= hash_block_size
     return max(checkpoint_position, 0)
+
+
+def get_mamba_periodic_prefill_checkpoints(
+    query_start: int,
+    query_end: int,
+    interval: int,
+    mamba_block_size: int,
+    hash_block_size: int,
+    checkpoint_alignment: int | None,
+    checkpoint_col: int = -1,
+    checkpoint_position: int = 0,
+) -> list[tuple[int, int]]:
+    """Exact periodic states strictly inside a query, never its source slot.
+
+    Columns keep their normal positional meaning. The separately exported
+    final hash checkpoint may borrow a column; do not also write a periodic
+    state into that same physical destination.
+    """
+    if interval <= 0 or checkpoint_alignment is None:
+        return []
+    assert interval % mamba_block_size == 0
+    assert interval % hash_block_size == 0
+    initial_col = (query_start - 1) // mamba_block_size
+    first = (query_start // interval + 1) * interval
+    return [
+        (position, position // mamba_block_size - 1)
+        for position in range(first, query_end, interval)
+        if position // mamba_block_size - 1 > initial_col
+        and position // mamba_block_size - 1 != checkpoint_col
+        and position != checkpoint_position
+        and (position - query_start) % checkpoint_alignment == 0
+    ]
 
 
 def is_mamba_prefill_checkpoint_valid(

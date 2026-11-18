@@ -235,6 +235,7 @@ class KVCacheCoordinator(ABC):
 
         """
         num_blocks_to_allocate = 0
+        periodic_prefill_end = prefill_end
         if self.retention_interval != 0:
             prefill_end = 0
         for i, manager in enumerate(self.single_type_managers):
@@ -259,7 +260,12 @@ class KVCacheCoordinator(ABC):
                     num_local_computed_tokens,
                     num_tokens_main_model,
                     apply_admission_cap=apply_admission_cap,
-                    prefill_end=prefill_end,
+                    prefill_end=(
+                        periodic_prefill_end
+                        if isinstance(manager.kv_cache_spec, MambaSpec)
+                        and manager.kv_cache_spec.prefill_checkpoint_interval
+                        else prefill_end
+                    ),
                 )
         return num_blocks_to_allocate
 
