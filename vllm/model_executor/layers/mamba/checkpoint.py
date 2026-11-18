@@ -14,6 +14,7 @@ from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 from vllm.v1.kv_cache_interface import (
     MambaSpec,
     get_mamba_prefill_checkpoint_position,
+    get_mamba_periodic_prefill_checkpoints,
     is_mamba_prefill_checkpoint_valid,
 )
 
@@ -84,6 +85,9 @@ class MambaPrefillCheckpointMetadata:
     # with the same spec can re-derive its own ``state_indices``.
     request_rows: torch.Tensor | None = None
     block_cols: torch.Tensor | None = None
+    # Relative source row for each flattened export. None means one per row,
+    # preserving the upstream Mamba2/KDA metadata layout.
+    source_rows: list[int] | None = None
 
     def regather_state_indices(
         self, block_table: torch.Tensor
@@ -140,6 +144,31 @@ class MambaPrefillCheckpointBuilder:
             cache_hit_alignment_tokens=cache_hit_alignment_tokens,
             num_hash_lookahead_tokens=self.vllm_config.num_hash_lookahead_tokens,
         )
+        source_rows = None
+        interval = self.kv_cache_spec.prefill_checkpoint_interval
+        if interval:
+            offsets, cols, sources, rows = [], [], [], []
+            for i, row in enumerate(request_rows):
+                start = seq_lens[row] - query_lens[i]
+                exports = get_mamba_periodic_prefill_checkpoints(
+                    start,
+                    seq_lens[row],
+                    interval,
+                    block_size,
+                    hash_block_size,
+                    self.kv_cache_spec.prefill_checkpoint_alignment,
+                    checkpoint_cols[i],
+                    start + checkpoint_offsets[i] if checkpoint_offsets[i] else 0,
+                )
+                if checkpoint_offsets[i]:
+                    exports.append((start + checkpoint_offsets[i], checkpoint_cols[i]))
+                for position, col in sorted(exports):
+                    offsets.append(position - start)
+                    cols.append(col)
+                    sources.append(i)
+                    rows.append(row)
+            checkpoint_offsets, checkpoint_cols = offsets, cols
+            request_rows, source_rows = rows, sources
         if not any(checkpoint_offsets):
             return None
         checkpoint_offsets_tensor = async_tensor_h2d(
@@ -162,6 +191,7 @@ class MambaPrefillCheckpointBuilder:
             query_lens=query_lens,
             request_rows=request_rows_tensor,
             block_cols=checkpoint_cols_tensor,
+            source_rows=source_rows,
         )
 
 
