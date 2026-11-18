@@ -176,6 +176,68 @@ def _warm_gated_rms_norm_kernel(
     )
 
 
+def _warm_fused_gdn_gated_rms_norm_kernel(
+    device: torch.device,
+    static_forward_context: object,
+    max_num_tokens: int,
+    x_dtype: torch.dtype,
+) -> None:
+    """Compile the fused gated norm a layer built with fused_gdn_gated_rms_norm
+    calls in place of the FLA layer norm (the CUDA Qwen3.5 model). The kernel's
+    ROWS_PER_BLOCK and num_tokens specialization both follow the token count, so
+    warm one count per (specialization class, rows per block) pair, through the
+    layer's own wrapper and with z strided out of a packed qkvz buffer as in
+    serving."""
+    from vllm.model_executor.warmup.jit_warmup_triton_helper import (
+        triton_scalar_specialization_rep,
+    )
+    from vllm.third_party.flash_linear_attention.ops.layernorm_guard import (
+        calc_rows_per_block,
+    )
+
+    layer = next(
+        (
+            module
+            for module in _iter_qwen_gdn_layers(static_forward_context)
+            if getattr(module, "_fused_gdn_gated_rms_norm", None) is not None
+            and not module.gqa_interleaved_layout
+        ),
+        None,
+    )
+    if layer is None:
+        return
+
+    hv = layer.num_v_heads // layer.tp_size
+    qkv_size = (layer.key_dim * 2 + layer.value_dim) // layer.tp_size
+    z_size = layer.value_dim // layer.tp_size
+    num_tokens_by_key: dict[tuple[int, int], int] = {}
+    for num_tokens in range(1, max_num_tokens + 1):
+        key = (
+            triton_scalar_specialization_rep(num_tokens),
+            calc_rows_per_block(num_tokens, device),
+        )
+        num_tokens_by_key.setdefault(key, num_tokens)
+
+    for num_tokens in num_tokens_by_key.values():
+        mixed_qkvz = torch.zeros(
+            (num_tokens, qkv_size + z_size), dtype=x_dtype, device=device
+        )
+        _, z = mixed_qkvz.split([qkv_size, z_size], dim=-1)
+        out2d = torch.zeros((num_tokens, z_size), dtype=x_dtype, device=device)
+        layer._fused_gdn_gated_rms_norm(
+            x=out2d,
+            z=z,
+            weight=layer.norm.weight,
+            out=out2d,
+            out_proj=layer.out_proj,
+            eps=layer.norm.eps,
+            num_v_heads=hv,
+            head_v_dim=layer.head_v_dim,
+            norm_before_gate=layer.norm.norm_before_gate,
+            activation=layer.norm.activation,
+        )
+
+
 def _warm_causal_conv1d_fwd_kernel(
     device: torch.device, config: _QwenGDNWarmupConfig
 ) -> None:
@@ -412,6 +474,12 @@ def qwen_triton_warmup(
 
     max_num_tokens = max(1, int(runner.max_num_tokens))
     _warm_gated_rms_norm_kernel(device, gdn_config, max_num_tokens, model_config.dtype)
+    _warm_fused_gdn_gated_rms_norm_kernel(
+        device,
+        runner.compilation_config.static_forward_context,
+        max_num_tokens,
+        model_config.dtype,
+    )
     _warm_causal_conv1d_fwd_kernel(device, gdn_config)
     _warm_fused_post_conv_kernel(device, gdn_config)
     # Pooling only runs full prefills; the decode update kernel is unused.
