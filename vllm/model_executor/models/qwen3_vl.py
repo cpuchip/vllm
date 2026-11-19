@@ -637,7 +637,10 @@ class Qwen3_VisionTransformer(nn.Module):
         )
 
         vision_offloader = None
-        if envs.VLLM_VISION_CPU_OFFLOAD_GB > 0:
+        # Under pipeline parallelism every rank after the first builds the
+        # tower on the meta device (no_init_weights in _mark_tower_model) and
+        # replaces it with a stage stub; there is nothing to copy to the host.
+        if envs.VLLM_VISION_CPU_OFFLOAD_GB > 0 and not torch.empty(0).is_meta:
             from vllm.model_executor.offloader.uva import UVAOffloader
 
             vision_offloader = UVAOffloader(
