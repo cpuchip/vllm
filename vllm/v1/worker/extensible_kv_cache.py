@@ -4,6 +4,7 @@
 
 import copy
 import gc
+import weakref
 from bisect import bisect_right
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -121,6 +122,10 @@ class ExtensibleKVCache:
         # Bytes torch's caching allocator may reserve, set once the cache is
         # sized; None leaves it unlimited.
         self.torch_memory_limit: int | None = None
+        # Blocks the cache holds once `extend_kv_cache` has sized it; None before.
+        self.final_num_blocks: int | None = None
+        global _active_kv_cache
+        _active_kv_cache = weakref.ref(self)
         self.buffer = ExtensibleTensor(
             self.size,
             device=device,
@@ -179,6 +184,18 @@ class ExtensibleKVCache:
         if offsets[0] != 0 or end > self.size:
             raise ValueError("KV cache tensors do not tile the allocation.")
         return offsets, strides
+
+    def blocks_backing(self, end_ptr: int) -> int | None:
+        """Blocks to commit so that the byte just below device address end_ptr is backed.
+
+        Lets a writer that indexes the pool in its own units (kernel blocks, tiles) find the block count from the
+        address it writes. None for an address outside this cache.
+        """
+        rel = end_ptr - 1 - self.buffer.base_ptr
+        for offset, stride in zip(self.segment_offsets, self.segment_strides):
+            if offset <= rel < offset + self.capacity_blocks * stride:
+                return (rel - offset) // stride + 1
+        return None
 
     @property
     def min_committed_blocks(self) -> int:
@@ -470,6 +487,32 @@ def pad_kv_cache_segments(
     return padded
 
 
+_active_kv_cache: "weakref.ref[ExtensibleKVCache] | None" = None
+
+
+def kv_cache_blocks_backing(end_ptr: int) -> int | None:
+    """`ExtensibleKVCache.blocks_backing` on this process's cache; None without one."""
+    cache = _active_kv_cache() if _active_kv_cache is not None else None
+    return None if cache is None else cache.blocks_backing(end_ptr)
+
+
+def kv_blocks_writable(num_blocks: int) -> int | None:
+    """Back this process's extensible KV cache for a write outside the model's forward, and return the block bound.
+
+    For a backend that writes the KV pool from its metadata builder (KVarN's deferred int4 flush), which has no
+    runner to pass to ensure_kv_cache_blocks. Before the cache is sized it commits up to num_blocks, as warmup does.
+    Once sized it commits nothing: block ids at or past the final size are left from warmup, the scheduler never
+    hands them out, and backing them would take memory the sizing did not budget. The caller writes only blocks
+    below the returned count. None without an extensible cache.
+    """
+    cache = _active_kv_cache() if _active_kv_cache is not None else None
+    if cache is None:
+        return None
+    if cache.final_num_blocks is None and num_blocks > cache.num_committed_blocks:
+        cache.commit(num_blocks)
+    return cache.num_committed_blocks
+
+
 def num_committable_kv_blocks(runner: "GPUModelRunner") -> int:
     """Blocks warmup may address: all of them, or, for an extensible cache,
     the count agreed across ranks so that every rank warms up the same shapes."""
@@ -533,6 +576,7 @@ def extend_kv_cache(
         shrink=True,
     )
     runner.kv_cache_config.num_blocks = kv_cache.num_committed_blocks
+    kv_cache.final_num_blocks = kv_cache.num_committed_blocks
     logger.info(
         "Extended KV cache to %d blocks (%.2f GiB).",
         kv_cache.num_committed_blocks,
