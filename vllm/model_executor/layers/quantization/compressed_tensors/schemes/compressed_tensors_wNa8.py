@@ -160,7 +160,17 @@ class CompressedTensorsWNA8Int(CompressedTensorsScheme):
             zero_points=not self.symmetric,
         )
 
-        kernel_type = choose_mp_linear_kernel(mp_config)
+        if self.input_quant is not None:
+            # Only Humming reads _humming_input_quant_config. choose_mp_linear_kernel ranks Marlin above it on CUDA
+            # (act_type is the bf16/fp16 params dtype here), and Marlin would serve these layers as W4A16.
+            from vllm.model_executor.kernels.linear import HummingLinearKernel
+
+            ok, why = HummingLinearKernel.can_implement(mp_config)
+            if not ok:
+                raise ValueError(f"CompressedTensorsWNA8Int needs Humming for int8 activations: {why}")
+            kernel_type = HummingLinearKernel
+        else:
+            kernel_type = choose_mp_linear_kernel(mp_config)
         if kernel_type.__name__ not in self._kernel_backends_being_used:
             logger.info("Using %s for CompressedTensorsWNA8Int", kernel_type.__name__)
             self._kernel_backends_being_used.add(kernel_type.__name__)
