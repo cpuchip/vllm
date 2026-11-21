@@ -14,6 +14,11 @@ from vllm.utils.import_utils import has_humming
 
 from .MPLinearKernel import MPLinearKernel, MPLinearLayerConfig
 
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
+_A_DTYPES_SEEN: set[str] = set()
+
 # Per-token activation quantization requested through `act_type`.
 _ACT_QUANT_KEYS = {
     torch.int8: kInt8DynamicTokenSym,
@@ -65,12 +70,23 @@ class HummingLinearKernel(MPLinearKernel):
         input_schema = None
         if (act_key := _ACT_QUANT_KEYS.get(self.config.act_type)) is not None:
             input_schema = quant_key_to_input_schema(act_key)
+        # An explicit input quant config (CompressedTensorsWNA8Int) is honoured: with fallback allowed, Humming's
+        # check_and_fallback_input_schema returns a 16-bit input schema for int8 activations on groupwise weights.
         self.layer_config = prepare_humming_linear_layer_config(
             layer,
             quant_config,
             input_quant_config=input_quant_config,
             input_schema=input_schema,
+            allow_input_schema_fallback=input_quant_config is None and input_schema is None,
         )
+        a_dtype = str(getattr(self.layer_config, "a_dtype", None))
+        if a_dtype not in _A_DTYPES_SEEN:
+            _A_DTYPES_SEEN.add(a_dtype)
+            logger.info(
+                "Humming layer config: a_dtype=%s (input quant config %s)",
+                a_dtype,
+                "set" if input_quant_config is not None else "none",
+            )
         self.compute_config = get_humming_linear_compute_config()
         self.locks = create_humming_locks(layer.weight.device)
 
